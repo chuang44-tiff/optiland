@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import optiland.backend as be
 from optiland.fileio.codev.model import CodeVDataModel
 from optiland.fileio.codev.surfaces import get_handler_for_optiland_type
+from optiland.fileio.codev.writer.glass_names import codev_glass_name
 from optiland.fileio.common import (
     compute_abbe_number,
     field_type_string,
@@ -23,7 +24,6 @@ from optiland.fileio.common import (
     validate_material_propagation,
 )
 from optiland.materials.data import DataMaterial
-from optiland.materials.material import Material
 
 if TYPE_CHECKING:
     from optiland.optic import Optic
@@ -34,6 +34,29 @@ _GEOM_STR_TO_TYPE: dict[str, str] = {
     "Standard": "standard",
     "Even Asphere": "even_asphere",
 }
+
+# CODE V has no infinity; an object distance of 1e10 or more is treated as infinite.
+_INFINITE_OBJECT_DISTANCE = 1e10
+
+
+def _object_distance(thickness: float) -> float:
+    """Map an Optiland object distance to a value CODE V can read.
+
+    Args:
+        thickness: Object surface thickness; ``+inf`` means an object at infinity.
+
+    Returns:
+        ``1e10`` for ``+inf``, otherwise ``thickness`` unchanged.
+
+    Raises:
+        ValueError: If ``thickness`` is NaN or ``-inf``.
+    """
+    if math.isnan(thickness) or thickness == -math.inf:
+        raise ValueError(
+            f"Object surface thickness is not finite ({thickness!r}); "
+            "only +inf (object at infinity) can be exported"
+        )
+    return _INFINITE_OBJECT_DISTANCE if thickness == math.inf else thickness
 
 
 class OpticToCodeVConverter:
@@ -181,7 +204,9 @@ class OpticToCodeVConverter:
         output_idx = 0
 
         # Object surface (SO)
-        obj_thickness = float(be.atleast_1d(be.array(obj_surface.thickness)).ravel()[0])
+        obj_thickness = _object_distance(
+            float(be.atleast_1d(be.array(obj_surface.thickness)).ravel()[0])
+        )
         model.surfaces[output_idx] = {
             "type": "object",
             "radius": 0.0,
@@ -212,8 +237,19 @@ class OpticToCodeVConverter:
                 "is not supported by the CODE V writer."
             )
 
+        interaction_type = surface.interaction_model.interaction_type
+        if interaction_type != "refractive_reflective":
+            label = "thin-lens" if interaction_type == "thin_lens" else interaction_type
+            raise NotImplementedError(
+                f"Surface {output_idx}: {label} surfaces cannot be exported "
+                "to CODE V yet"
+            )
+
         handler = get_handler_for_optiland_type(optiland_type)
-        raw = handler.format(surface)
+        try:
+            raw = handler.format(surface)
+        except NotImplementedError as exc:
+            raise NotImplementedError(f"Surface {output_idx}: {exc}") from None
 
         thickness = float(be.atleast_1d(be.array(surface.thickness)).ravel()[0])
         raw["thickness"] = thickness
@@ -225,10 +261,6 @@ class OpticToCodeVConverter:
         # Physical aperture
         if surface.aperture is not None:
             raw["aperture"] = surface.aperture
-
-        # Paraxial surface
-        if surface.interaction_model.interaction_type == "thin_lens":
-            raw["paraxial"] = float(surface.interaction_model.f)
 
         # Glass — check reflective flag first (mirror)
         is_reflective = getattr(
@@ -288,22 +320,19 @@ class OpticToCodeVConverter:
         if isinstance(mat, str) and mat.lower() == "mirror":
             return {"name": "REFL"}
 
-        # Catalog glass
-        if isinstance(mat, Material) and mat.reference:
-            catalog = mat.reference.upper()
-            return {"name": mat.name.upper(), "catalog": catalog}
+        # Catalog glass with a verified CODE V name
+        named = codev_glass_name(mat)
+        if named is not None:
+            return {"name": named[0], "catalog": named[1]}
 
-        if isinstance(mat, Material):
-            return {"name": mat.name.upper()}
-
-        # AbbeMaterial or unknown -> Nd:Vd fictitious glass
+        # Everything else -> Nd:Vd fictitious glass
         n_d, v_d = compute_abbe_number(mat, float(self._optic.primary_wavelength))
 
         mat_name = getattr(mat, "name", type(mat).__name__)
         warnings.warn(
             f"Surface {surf_idx}: glass '{mat_name}' has no CODE V catalog entry; "
             f"writing as fictitious glass (Nd={n_d:.6f}, Vd={v_d:.2f}). "
-            "Round-trip fidelity is not guaranteed.",
+            "Dispersion is approximated and round-trip fidelity is not guaranteed.",
             UserWarning,
             stacklevel=4,
         )

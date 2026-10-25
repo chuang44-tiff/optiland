@@ -40,7 +40,7 @@ def save_codev_file(optic: Optic, filepath: str) -> None:
     model = OpticToCodeVConverter(optic).convert()
     lines = CodeVFileEncoder(model).encode()
     with open(filepath, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
+        fh.write("\n".join(lines) + "\n")
 
 
 class CodeVWriter(BaseOpticWriter):

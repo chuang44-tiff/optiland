@@ -240,19 +240,24 @@ class EvenAsphereSurfaceHandler(BaseSurfaceHandler):
             surface: The Optiland surface.
 
         Returns:
-            Raw operand dict for CodeVFileEncoder.
+            Raw operand dict for CodeVFileEncoder (radius and conic only).
+
+        Raises:
+            NotImplementedError: If any aspheric coefficient is non-zero (or NaN).
+                Optiland's ``coefficients[i]`` multiplies ``r**(2i+2)`` while CODE V
+                letter ``A`` multiplies ``r**4``, so the coefficients cannot be
+                written as they are.
         """
         geom = surface.geometry
-        coeffs: list[float] = list(geom.coefficients) if geom.coefficients else []
-        # Pad to 9 terms (A–J)
-        while len(coeffs) < len(self._COEFF_KEYS):
-            coeffs.append(0.0)
-
-        result: dict[str, Any] = {
+        coeffs = [float(c) for c in geom.coefficients] if geom.coefficients else []
+        # Written as "not <=" so that a NaN is refused as well.
+        if any(not abs(c) <= 1e-30 for c in coeffs):
+            raise NotImplementedError(
+                "even-asphere coefficients cannot be exported to CODE V yet "
+                "(coefficient powers are being corrected)"
+            )
+        return {
             "profile": self.codev_type,
             "radius": _raw_from_radius(float(geom.radius)),
             "conic": float(getattr(geom, "k", 0.0)),
         }
-        for i, _key in enumerate(self._COEFF_KEYS):
-            result[f"coeff_{i}"] = float(coeffs[i])
-        return result
