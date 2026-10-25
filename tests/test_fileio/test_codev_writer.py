@@ -242,11 +242,12 @@ class TestCodeVFileEncoder:
         optic = _make_conic_sphere(material=AbbeMaterial(1.5168, 64.17))
         model = OpticToCodeVConverter(optic).convert()
         lines = CodeVFileEncoder(model).encode()
-        # Fictitious glass is written as Nd:Vd on the surface line
+        # An unnamed glass is a private glass, never an Nd:Vd token
         s_lines = [
             l for l in lines if l.strip().startswith("S ") or l.startswith("S  ")
         ]
-        assert any(":" in line for line in s_lines)
+        assert any(line.endswith("'OPT1'") for line in s_lines)
+        assert not any(":" in line for line in s_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -399,11 +400,11 @@ class TestOpticToCodeVConverterExtended:
         optic.surfaces.add(index=2, thickness=0.0)
         optic.add_wavelength(0.5876, is_primary=True)
         conv = OpticToCodeVConverter(optic)
-        with pytest.warns(UserWarning, match="writing as fictitious glass"):
+        with pytest.warns(UserWarning, match="private glass"):
             model = conv.convert()
         # Obj(0) + Surf(1) + Img(2)
-        assert "glass" in model.surfaces[1]
-        assert float(model.surfaces[1]["glass"]["nd"]) == pytest.approx(1.7)
+        assert model.surfaces[1]["glass"] == {"private": "OPT1"}
+        assert model.private_glasses["OPT1"] == [pytest.approx(1.7)]
 
     def test_reflective_surface_codev(self):
         optic = Optic()
@@ -646,13 +647,16 @@ class TestNonFinite:
         path.write_bytes(b"previous design")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with pytest.raises(ValueError, match=r"Surface 1: non-finite (nd|vd)"):
+            with pytest.raises(
+                ValueError, match=r"Surface 1: non-finite index .* private glass"
+            ):
                 save_codev_file(optic, str(path))
         assert path.read_bytes() == b"previous design"
 
-    @pytest.mark.parametrize("bad_vd", [float("nan"), float("inf")])
-    def test_nonfinite_vd_with_finite_nd_raises_and_leaves_file(
-        self, bad_vd, tmp_path, set_test_backend
+    @pytest.mark.parametrize("bad_n", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("bad_wl", [0.6563, 0.4861], ids=["first", "last"])
+    def test_nonfinite_index_at_any_wavelength_raises_and_leaves_file(
+        self, bad_n, bad_wl, tmp_path, set_test_backend
     ):
         import warnings
 
@@ -661,36 +665,35 @@ class TestNonFinite:
         from optiland.materials import IdealMaterial
 
         class _OddDispersion(IdealMaterial):
-            """Finite n at the 0.55 um primary; F/C/d lines chosen to break Vd."""
+            """Finite index everywhere except at ``bad_wl``."""
 
             def n(self, wavelength, **kwargs):
                 wl = np.asarray(wavelength, dtype=float)
-                nan_f = np.isnan(bad_vd)
-                n_f = np.nan if nan_f else 1.6
-                n_d = 1.5 if nan_f else np.inf
-                return np.where(
-                    np.isclose(wl, 0.4861),
-                    n_f,
-                    np.where(np.isclose(wl, 0.5876), n_d, 1.5),
-                )
+                return np.where(np.isclose(wl, bad_wl), bad_n, 1.5)
 
+        # written order: 0.6563, 0.55, 0.4861
         optic = _make_conic_sphere(material=_OddDispersion(1.5))
         optic.wavelengths.wavelengths.clear()
         optic.wavelengths.add(value=0.55, is_primary=True)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = OpticToCodeVConverter(optic).convert()
-        glass = model.surfaces[1]["glass"]
-        assert np.isfinite(glass["nd"])
-        assert not np.isfinite(glass["vd"])
-
+        optic.wavelengths.add(value=0.4861)
+        optic.wavelengths.add(value=0.6563)
         path = tmp_path / "existing.seq"
         path.write_bytes(b"previous design")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with pytest.raises(ValueError, match=r"Surface 1: non-finite vd"):
+            with pytest.raises(
+                ValueError,
+                match=rf"Surface 1: non-finite index .* private glass 'OPT1' "
+                rf"at {bad_wl * 1000:g} nm",
+            ):
                 save_codev_file(optic, str(path))
         assert path.read_bytes() == b"previous design"
+
+    def test_private_glass_without_row_raises(self):
+        model = OpticToCodeVConverter(_make_conic_sphere()).convert()
+        model.surfaces[1]["glass"] = {"private": "OPT9"}
+        with pytest.raises(ValueError, match=r"Surface 1: private glass 'OPT9'"):
+            CodeVFileEncoder(model).encode()
 
     @pytest.mark.parametrize("r_max", [float("nan"), float("-inf")])
     def test_nonfinite_aperture_names_surface_and_leaves_file(
@@ -757,22 +760,22 @@ class TestGlassNames:
         "args",
         [("SK16", "hikari"), ("LITHOTEC-CAF2", "schott"), ("S-APL", "ohara")],
     )
-    def test_unnamed_materials_use_index_and_warn(self, args, set_test_backend):
+    def test_unnamed_materials_use_private_glass_and_warn(self, args, set_test_backend):
         from optiland.fileio.codev.writer.glass_names import codev_glass_name
         from optiland.materials import Material
 
         mat = Material(*args)
         assert codev_glass_name(mat) is None
-        with pytest.warns(UserWarning, match="fictitious glass"):
+        with pytest.warns(UserWarning, match="private glass"):
             lines = self._lines_with(mat)
         token = _glass_token(_surface_lines(lines)[0])
-        assert ":" in token
+        assert token == "'OPT1'"
         assert "HIKARI" not in "\n".join(lines).upper()
 
     def test_catalog_air_not_named(self, set_test_backend):
         from optiland.materials import Material
 
-        with pytest.warns(UserWarning, match="fictitious glass"):
+        with pytest.warns(UserWarning, match="private glass"):
             lines = self._lines_with(Material("air"))
         text = "\n".join(lines).upper()
         assert "AIR_" not in text
@@ -876,9 +879,10 @@ class TestGlassNames:
             if token is None or token == "REFL":
                 continue
             assert re.fullmatch(
-                r"[A-Z0-9]+_(SCHOTT|OHARA|HOYA|CDGM|SUMITA)|\d+\.\d+:\d+\.\d+", token
+                r"[A-Z0-9]+_(SCHOTT|OHARA|HOYA|CDGM|SUMITA)|'OPT\d+'", token
             ), line
             assert "-" not in token
+            assert ":" not in token
 
 
 # ---------------------------------------------------------------------------
@@ -933,3 +937,997 @@ class TestInteractionRefusal:
         optic.surfaces.add(index=1, radius=100.0, thickness=-50.0, material="mirror")
         optic.surfaces.add(index=2, thickness=0.0)
         assert any("REFL" in line for line in _encode(optic))
+
+
+# ---------------------------------------------------------------------------
+# Wavelength weights reach the model
+# ---------------------------------------------------------------------------
+
+
+class TestWavelengthWeightsInModel:
+    @staticmethod
+    def _optic(weights, primary=0) -> Optic:
+        optic = _make_lens()
+        optic.wavelengths.wavelengths.clear()
+        values = (0.5876, 0.4861, 0.6563)
+        for i, (value, weight) in enumerate(zip(values, weights, strict=True)):
+            optic.wavelengths.add(value=value, is_primary=i == primary, weight=weight)
+        return optic
+
+    def test_wavelength_weights_in_model(self, set_test_backend):
+        model = OpticToCodeVConverter(self._optic((1.0, 2.0, 0.5))).convert()
+        assert model.wavelengths["weights"] == [1.0, 2.0, 0.5]
+        assert model.wavelengths["data"] == [0.5876, 0.4861, 0.6563]
+        assert model.wavelengths["primary_index"] == 0
+
+    def test_zero_weight_in_model(self, set_test_backend):
+        model = OpticToCodeVConverter(self._optic((1.0, 0.0, 1.0))).convert()
+        assert model.wavelengths["weights"] == [1.0, 0.0, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Wavelength order: CODE V sorts WL descending, then applies REF/WTW by position
+# ---------------------------------------------------------------------------
+
+
+def _cmd(lines: list[str], name: str) -> list[float]:
+    """Numbers after the single ``name`` command in the emitted lines."""
+    found = [line.split()[1:] for line in lines if line.split()[:1] == [name]]
+    assert len(found) == 1, name
+    return [float(tok) for tok in found[0]]
+
+
+class TestWavelengthOrder:
+    @staticmethod
+    def _optic(values, primary, weights=None) -> Optic:
+        optic = _make_lens()
+        optic.wavelengths.wavelengths.clear()
+        for i, value in enumerate(values):
+            weight = 1.0 if weights is None else weights[i]
+            optic.wavelengths.add(value=value, is_primary=i == primary, weight=weight)
+        return optic
+
+    def test_wl_written_descending(self, set_test_backend):
+        lines = _encode(_make_singlet())
+        assert lines.count("WL 656.3 587.6 486.1") == 1
+        assert "REF 2" in lines
+
+    @pytest.mark.parametrize(
+        "primary", [0, 1, 2], ids=["shortest", "middle", "longest"]
+    )
+    def test_ref_points_at_primary(self, primary, set_test_backend):
+        values = [0.4861, 0.5876, 0.6563]
+        lines = _encode(self._optic(values, primary))
+        ref = int(_cmd(lines, "REF")[0])
+        assert_allclose(_cmd(lines, "WL")[ref - 1], values[primary] * 1000.0)
+        # unsorted input must give the same answer
+        shuffled = [values[2], values[0], values[1]]
+        lines = _encode(self._optic(shuffled, shuffled.index(values[primary])))
+        ref = int(_cmd(lines, "REF")[0])
+        assert_allclose(_cmd(lines, "WL")[ref - 1], values[primary] * 1000.0)
+
+    def test_wtw_permuted(self, set_test_backend):
+        # weights: 587.6 -> 0.5, 486.1 -> 2, 656.3 -> 1
+        optic = self._optic([0.5876, 0.4861, 0.6563], 0, weights=[0.5, 2.0, 1.0])
+        lines = _encode(optic)
+        assert _cmd(lines, "WL") == [656.3, 587.6, 486.1]
+        assert _cmd(lines, "WTW") == [1.0, 0.5, 2.0]
+        assert _cmd(lines, "REF") == [2.0]
+
+    def test_equal_wavelengths_ref_by_index(self, set_test_backend):
+        optic = self._optic([0.55, 0.55, 0.65], 1, weights=[1.0, 2.0, 3.0])
+        lines = _encode(optic)
+        assert _cmd(lines, "WL") == [650.0, 550.0, 550.0]
+        assert _cmd(lines, "WTW") == [3.0, 1.0, 2.0]
+        assert _cmd(lines, "REF") == [3.0]
+
+    def test_weight_length_mismatch_raises(self, set_test_backend):
+        model = OpticToCodeVConverter(_make_singlet()).convert()
+        model.wavelengths["weights"] = [1.0, 1.0]
+        with pytest.raises(ValueError, match="wavelength weights"):
+            CodeVFileEncoder(model).encode()
+
+    def test_model_not_mutated_by_encode(self, set_test_backend):
+        import copy
+
+        model = OpticToCodeVConverter(_make_singlet()).convert()
+        before = copy.deepcopy(model.wavelengths)
+        CodeVFileEncoder(model).encode()
+        assert model.wavelengths == before
+        assert model.wavelengths["data"][0] == 0.5876
+        assert model.wavelengths["primary_index"] == 0
+
+    def test_write_order_helper(self):
+        from optiland.fileio.codev.writer.encoder import wavelength_write_order
+
+        assert wavelength_write_order({"data": [0.5, 0.7, 0.5, 0.6]}) == [1, 3, 0, 2]
+        assert wavelength_write_order({"data": []}) == []
+        assert wavelength_write_order({}) == []
+
+    def test_cooke_triplet_regression(self, set_test_backend):
+        import warnings
+
+        from optiland.samples.objectives import CookeTriplet
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lines = _encode(CookeTriplet())
+        assert "WL 650 550 480" in lines
+        assert "REF 2" in lines
+
+
+# ---------------------------------------------------------------------------
+# Private glass (PRV) for materials without a verified CODE V name
+# ---------------------------------------------------------------------------
+
+
+def _three_wavelengths(optic: Optic) -> Optic:
+    """Primary 587.6 first, then 486.1 and 656.3 (not in descending order)."""
+    optic.wavelengths.wavelengths.clear()
+    optic.wavelengths.add(value=0.5876, is_primary=True)
+    optic.wavelengths.add(value=0.4861)
+    optic.wavelengths.add(value=0.6563)
+    return optic
+
+
+def _prv_block(lines: list[str]) -> list[str]:
+    start = lines.index("PRV")
+    return lines[start : lines.index("END", start) + 1]
+
+
+def _row(line: str) -> tuple[str, list[float]]:
+    name, *values = line.split()
+    return name, [float(v) for v in values]
+
+
+def _lens_with_materials(*materials) -> Optic:
+    """Lens with one surface per material (the last gap is air) at 3 wavelengths."""
+    optic = Optic()
+    optic.surfaces.add(index=0, thickness=float("inf"))
+    for i, material in enumerate(materials, start=1):
+        optic.surfaces.add(
+            index=i,
+            radius=50.0 * (-1) ** i,
+            thickness=5.0,
+            material=material,
+            is_stop=i == 1,
+        )
+    optic.surfaces.add(index=len(materials) + 1)
+    optic.set_aperture(aperture_type="EPD", value=10.0)
+    optic.fields.set_type("angle")
+    optic.fields.add(y=0.0)
+    return _three_wavelengths(optic)
+
+
+def _n_at_written_wavelengths(mat) -> list[float]:
+    import optiland.backend as be
+
+    return [float(be.to_numpy(mat.n(nm / 1000.0))) for nm in (656.3, 587.6, 486.1)]
+
+
+class TestPrivateGlass:
+    @staticmethod
+    def _encode_quiet(optic: Optic) -> list[str]:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return _encode(optic)
+
+    def test_ideal_prv_block(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        with pytest.warns(UserWarning, match="private glass"):
+            lines = _encode(_lens_with_materials(IdealMaterial(1.7)))
+        start = lines.index("PRV")
+        assert lines[start : start + 4] == [
+            "PRV",
+            "  PWL 656.3 587.6 486.1",
+            "  'OPT1' 1.7 1.7 1.7",
+            "END",
+        ]
+        # after the header lines, before the object surface
+        assert lines[start - 1].startswith("YAN")
+        assert start < next(i for i, line in enumerate(lines) if line.startswith("SO "))
+        assert _glass_token(_surface_lines(lines)[0]) == "'OPT1'"
+        assert not any(":" in line for line in _surface_lines(lines))
+
+    def test_abbe_prv_matches_optiland_n(self, set_test_backend):
+        from optiland.materials import AbbeMaterial
+
+        mat = AbbeMaterial(1.6, 50, "buchdahl")
+        lines = self._encode_quiet(_lens_with_materials(mat))
+        name, row = _row(_prv_block(lines)[2].strip())
+        assert name == "'OPT1'"
+        assert_allclose(row, _n_at_written_wavelengths(mat), rtol=1e-9)
+        # not the constant nd the old Nd:Vd path would imply
+        assert abs(row[0] - 1.6) > 1e-4
+        assert abs(row[2] - 1.6) > 1e-4
+
+    def test_abbe_polynomial_out_of_range(self, tmp_path, set_test_backend):
+        from optiland.materials import AbbeMaterial
+
+        optic = _lens_with_materials(AbbeMaterial(1.6, 50, "polynomial"))
+        optic.wavelengths.add(value=1.0)
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(ValueError, match=r"Surface 1: material .* no index at 1.0"):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_dedup_and_names(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        same = self._encode_quiet(
+            _lens_with_materials(IdealMaterial(1.5), IdealMaterial(1.5))
+        )
+        assert _prv_block(same)[2:-1] == ["  'OPT1' 1.5 1.5 1.5"]
+        assert [_glass_token(line) for line in _surface_lines(same)[:2]] == [
+            "'OPT1'",
+            "'OPT1'",
+        ]
+        distinct = self._encode_quiet(
+            _lens_with_materials(
+                IdealMaterial(1.5), IdealMaterial(1.6), IdealMaterial(1.7)
+            )
+        )
+        names = [_row(line.strip())[0] for line in _prv_block(distinct)[2:-1]]
+        assert names == ["'OPT1'", "'OPT2'", "'OPT3'"]
+        assert [_glass_token(line) for line in _surface_lines(distinct)[:3]] == names
+
+    def test_pwl_equals_wl(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        lines = self._encode_quiet(_lens_with_materials(IdealMaterial(1.5)))
+        assert _cmd(_prv_block(lines)[1:2], "PWL") == _cmd(lines, "WL")
+        assert _cmd(lines, "WL") == [656.3, 587.6, 486.1]
+
+    def test_catalog_air_is_private(self, set_test_backend):
+        import warnings
+
+        from optiland.materials import Material
+
+        mat = Material("air")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            lines = _encode(_lens_with_materials(mat))
+        assert not any("catalog air" in str(w.message) for w in caught)
+        _, row = _row(_prv_block(lines)[2].strip())
+        assert_allclose(row, _n_at_written_wavelengths(mat), rtol=1e-9)
+        assert row[1] == pytest.approx(1.000277, abs=1e-6)
+        assert _glass_token(_surface_lines(lines)[0]) == "'OPT1'"
+
+    def test_hikari_is_private(self, set_test_backend):
+        import warnings
+
+        from optiland.materials import Material
+
+        mat = Material("SK16", "hikari")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            lines = _encode(_lens_with_materials(mat))
+        messages = [str(w.message) for w in caught]
+        assert any("private glass 'OPT1'" in m for m in messages)
+        assert any("extinction k" in m and "not exported" in m for m in messages)
+        _, row = _row(_prv_block(lines)[2].strip())
+        assert_allclose(row, _n_at_written_wavelengths(mat), rtol=1e-9)
+
+    def test_no_k_warning_without_extinction(self, set_test_backend):
+        import warnings
+
+        from optiland.materials import IdealMaterial
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _encode(_lens_with_materials(IdealMaterial(1.5)))
+        assert not any("extinction" in str(w.message) for w in caught)
+
+    def test_named_and_private_mixed(self, set_test_backend):
+        from optiland.materials import IdealMaterial, Material
+
+        lines = self._encode_quiet(
+            _lens_with_materials(Material("N-BK7", "schott"), IdealMaterial(1.7))
+        )
+        tokens = [_glass_token(line) for line in _surface_lines(lines)[:2]]
+        assert tokens == ["NBK7_SCHOTT", "'OPT1'"]
+        assert len(_prv_block(lines)) == 4
+
+    def test_no_prv_block_for_named_glass(self, set_test_backend):
+        lines = _encode(_make_singlet())
+        assert "PRV" not in lines
+        assert "END" not in lines
+
+    def test_ideal_absorption_still_refused(self, tmp_path, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        optic = _lens_with_materials(IdealMaterial(1.5, 0.1))
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(NotImplementedError, match="absorption"):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_empty_and_object_only_optics_have_no_prv(self, set_test_backend):
+        empty = OpticToCodeVConverter(Optic()).convert()
+        assert empty.private_glasses == {}
+        assert "PRV" not in CodeVFileEncoder(empty).encode()
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=1.0)
+        model = OpticToCodeVConverter(optic).convert()
+        assert model.private_glasses == {}
+        assert "PRV" not in CodeVFileEncoder(model).encode()
+
+    def test_no_wavelengths_with_private_glass_raises(self, tmp_path, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        optic = _lens_with_materials(IdealMaterial(1.5))
+        optic.wavelengths.wavelengths.clear()
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(
+            ValueError,
+            match=r"Surface 1: material .* needs a private glass but the system "
+            r"has no wavelengths",
+        ):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_converter_reuse_does_not_carry_private_glasses(self, set_test_backend):
+        import warnings
+
+        from optiland.materials import IdealMaterial
+
+        converter = OpticToCodeVConverter(_lens_with_materials(IdealMaterial(1.5)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            first = converter.convert()
+            converter._optic = _lens_with_materials(IdealMaterial(1.5))
+            second = converter.convert()
+        assert first.private_glasses == {"OPT1": [1.5, 1.5, 1.5]}
+        assert second.private_glasses == {"OPT1": [1.5, 1.5, 1.5]}
+        assert second.private_glasses is not first.private_glasses
+
+    @pytest.mark.parametrize("bad_n", [0.0, -1.5])
+    @pytest.mark.parametrize("bad_wl", [0.6563, 0.4861], ids=["first", "last"])
+    def test_nonpositive_index_raises_and_leaves_file(
+        self, bad_n, bad_wl, tmp_path, set_test_backend
+    ):
+        import warnings
+
+        import numpy as np
+
+        from optiland.materials import IdealMaterial
+
+        class _OddDispersion(IdealMaterial):
+            """Index 1.5 everywhere except at ``bad_wl``."""
+
+            def n(self, wavelength, **kwargs):
+                wl = np.asarray(wavelength, dtype=float)
+                return np.where(np.isclose(wl, bad_wl), bad_n, 1.5)
+
+        # written order: 0.6563, 0.55, 0.4861; the first surface takes OPT1
+        optic = _lens_with_materials(IdealMaterial(1.4), _OddDispersion(1.5))
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(
+                ValueError,
+                match=rf"Surface 2: non-physical index \({bad_n!r}\) of private "
+                rf"glass 'OPT2' at {bad_wl * 1000:g} nm",
+            ):
+                save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+
+# ---------------------------------------------------------------------------
+# A non-air object-space medium is refused
+# ---------------------------------------------------------------------------
+
+
+class TestObjectMediumRefusal:
+    @staticmethod
+    def _optic(object_material) -> Optic:
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=10.0, material=object_material)
+        optic.surfaces.add(
+            index=1,
+            radius=50.0,
+            thickness=5.0,
+            material=IdealMaterial(1.7),
+            is_stop=True,
+        )
+        optic.surfaces.add(index=2)
+        optic.set_aperture(aperture_type="EPD", value=10.0)
+        optic.fields.set_type("angle")
+        optic.fields.add(y=0.0)
+        optic.wavelengths.add(value=0.5876, is_primary=True)
+        return optic
+
+    @pytest.mark.parametrize("kind", ["ideal", "catalog_air", "glass"])
+    def test_object_medium_refused_and_file_untouched(
+        self, kind, tmp_path, set_test_backend
+    ):
+        from optiland.materials import IdealMaterial, Material
+
+        material = {
+            "ideal": lambda: IdealMaterial(1.5151),
+            "catalog_air": lambda: Material("air"),
+            "glass": lambda: Material("N-BK7", "schott"),
+        }[kind]()
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(
+            NotImplementedError,
+            match=r"^Surface 0: an object-space medium cannot be exported to CODE V "
+            r"yet$",
+        ):
+            save_codev_file(self._optic(material), str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_air_object_has_no_glass_token(self, set_test_backend):
+        import warnings
+
+        from optiland.materials import IdealMaterial
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lines = _encode(self._optic(IdealMaterial(1.0)))
+        assert next(line for line in lines if line.startswith("SO ")) == "SO 0 10"
+
+    def test_default_object_still_exported(self, set_test_backend):
+        lines = _encode(_make_lens())
+        assert any(line.startswith("SO ") for line in lines)
+
+    def test_empty_and_object_only_optics_not_refused(self, set_test_backend):
+        assert OpticToCodeVConverter(Optic()).convert().surfaces == {}
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=1.0)
+        assert 0 in OpticToCodeVConverter(optic).convert().surfaces
+
+
+# ---------------------------------------------------------------------------
+# Decenters, tilts and chained coordinate systems are refused
+# ---------------------------------------------------------------------------
+
+
+def _decenter_lines(lines: list[str]) -> list[str]:
+    """Lines that set a decenter or tilt (``XDE``, ``ADE``, ...)."""
+    return [
+        line for line in lines if line.split() and line.split()[0] in _DECENTER_KEYS
+    ]
+
+
+_DECENTER_KEYS = ("XDE", "YDE", "ADE", "BDE", "CDE", "ZDE")
+
+
+class TestOffsetRefusal:
+    @staticmethod
+    def _converter(optic: Optic) -> OpticToCodeVConverter:
+        return OpticToCodeVConverter(optic)
+
+    @pytest.mark.parametrize("key", ["x", "y", "rx", "ry", "rz"])
+    def test_lens_surface_offset_refused_and_file_untouched(
+        self, key, tmp_path, set_test_backend
+    ):
+        optic = _make_lens()
+        setattr(optic.surfaces[1].geometry.cs, key, 0.01)
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(
+            NotImplementedError,
+            match=rf"^Surface 1: decenters and tilts cannot be exported to CODE V "
+            rf"yet \(non-zero {key}\)$",
+        ):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_decenter_through_the_public_api_refused(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(index=1, radius=50.0, thickness=5.0, dy=1.0, is_stop=True)
+        optic.surfaces.add(index=2)
+        with pytest.raises(NotImplementedError, match=r"Surface 1: .*non-zero y"):
+            self._converter(optic).convert()
+
+    def test_all_offending_keys_named(self, set_test_backend):
+        optic = _make_lens()
+        cs = optic.surfaces[2].geometry.cs
+        cs.x = 0.5
+        cs.rz = 0.1
+        with pytest.raises(NotImplementedError, match=r"Surface 2: .*non-zero x, rz"):
+            self._converter(optic).convert()
+
+    def test_object_offset_refused(self, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[0].geometry.cs.y = 1.0
+        with pytest.raises(NotImplementedError, match=r"Surface 0: decenters"):
+            self._converter(optic).convert()
+
+    def test_image_offset_refused(self, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[3].geometry.cs.rx = 0.1
+        with pytest.raises(NotImplementedError, match=r"Surface 3: decenters"):
+            self._converter(optic).convert()
+
+    def test_chained_cs_refused(self, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[2].geometry.cs.reference_cs = optic.surfaces[1].geometry.cs
+        with pytest.raises(
+            NotImplementedError, match=r"Surface 2: chained coordinate systems"
+        ):
+            self._converter(optic).convert()
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+    def test_nonfinite_offset_value_error(self, value, tmp_path, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[1].geometry.cs.ry = value
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(ValueError, match=r"Surface 1: non-finite ry"):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_offset_below_threshold_not_refused(self, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[1].geometry.cs.x = 1e-13
+        self._converter(optic).convert()
+
+    @pytest.mark.parametrize("key", ["x", "y", "rx", "ry", "rz"])
+    def test_offset_at_the_threshold_writes_no_decenter_line(
+        self, key, set_test_backend
+    ):
+        optic = _make_lens()
+        setattr(optic.surfaces[1].geometry.cs, key, 1e-12)
+        assert not _decenter_lines(_encode(optic))
+
+    @pytest.mark.parametrize("value", [1.0000001e-12, 1e-11, 1e-10])
+    def test_offset_just_above_the_threshold_refused(self, value, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[1].geometry.cs.x = value
+        with pytest.raises(NotImplementedError, match=r"non-zero x"):
+            self._converter(optic).convert()
+
+    @pytest.mark.parametrize("value", [1e-12, -1e-12, 0.0])
+    def test_offset_up_to_the_threshold_not_refused(self, value, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[1].geometry.cs.y = value
+        self._converter(optic).convert()
+
+    def test_propagation_check_precedes_the_offset_check(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+        from optiland.propagation.homogeneous import HomogeneousPropagation
+
+        class CustomPropagation(HomogeneousPropagation):
+            pass
+
+        optic = _make_lens()
+        material = IdealMaterial(1.5)
+        material.propagation_model = CustomPropagation(material)
+        optic.surfaces[1].material_post = material
+        optic.surfaces[2].geometry.cs.x = 1.0  # also violates the offset check
+        with pytest.raises(NotImplementedError, match="custom propagation"):
+            self._converter(optic).convert()
+
+    def test_object_medium_check_precedes_the_offset_check(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        optic = _make_lens()
+        optic.surfaces[0].material_post = IdealMaterial(1.5)
+        optic.surfaces[2].geometry.cs.x = 1.0
+        with pytest.raises(NotImplementedError, match="object-space medium"):
+            self._converter(optic).convert()
+
+    def test_propagation_check_precedes_the_object_medium_check(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+        from optiland.propagation.homogeneous import HomogeneousPropagation
+
+        class CustomPropagation(HomogeneousPropagation):
+            pass
+
+        optic = _make_lens()
+        optic.surfaces[0].material_post = IdealMaterial(1.5)  # object medium
+        material = IdealMaterial(1.5)
+        material.propagation_model = CustomPropagation(material)
+        optic.surfaces[1].material_post = material  # custom propagation
+        with pytest.raises(NotImplementedError, match="custom propagation"):
+            self._converter(optic).convert()
+
+    def test_axial_position_is_not_an_offset(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(index=1, radius=50.0, z=0.0, is_stop=True)
+        optic.surfaces.add(index=2, z=30.0)
+        self._converter(optic).convert()
+
+    def test_empty_and_object_only_optics_not_refused(self, set_test_backend):
+        assert self._converter(Optic()).convert().surfaces == {}
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=1.0)
+        assert 0 in self._converter(optic).convert().surfaces
+
+    def test_all_samples_pass_offset_check(self, set_test_backend):
+        import inspect
+        import warnings
+
+        from optiland import samples
+
+        checked = 0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for module in vars(samples).values():
+                if not inspect.ismodule(module):
+                    continue
+                for cls in vars(module).values():
+                    if not (
+                        inspect.isclass(cls)
+                        and issubclass(cls, Optic)
+                        and cls.__module__ == module.__name__
+                    ):
+                        continue
+                    try:
+                        lines = CodeVFileEncoder(
+                            self._converter(cls()).convert()
+                        ).encode()
+                    except NotImplementedError as exc:
+                        # other refusals (asphere, ...) are not the offset guard
+                        assert "decenters and tilts" not in str(exc), cls.__name__
+                        assert "chained" not in str(exc), cls.__name__
+                    else:
+                        assert not _decenter_lines(lines), cls.__name__
+                    checked += 1
+        assert checked >= 25
+
+
+# ---------------------------------------------------------------------------
+# Thickness is the global z spacing of the vertices
+# ---------------------------------------------------------------------------
+
+
+def _thi_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith(("SO ", "S ", "SI "))]
+
+
+def _thi(lines: list[str]) -> list[float]:
+    """The thickness token of each SO / S / SI line, in file order."""
+    return [float(line.split()[2]) for line in _thi_lines(lines)]
+
+
+def _gcs_z(optic: Optic) -> list[float]:
+    return [float(s.geometry.cs.position_in_gcs[2]) for s in optic.surfaces]
+
+
+class TestThicknessFromGlobalZ:
+    @staticmethod
+    def _finish(optic: Optic) -> Optic:
+        optic.set_aperture(aperture_type="EPD", value=10.0)
+        optic.fields.set_type("angle")
+        optic.fields.add(y=0.0)
+        optic.wavelengths.add(value=0.5876, is_primary=True)
+        return optic
+
+    def test_absolute_z_lens(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, z=-100.0)
+        optic.surfaces.add(
+            index=1,
+            radius=50.0,
+            z=0.0,
+            material=IdealMaterial(1.5),
+            is_stop=True,
+        )
+        optic.surfaces.add(index=2, radius=-50.0, z=5.0)
+        optic.surfaces.add(index=3, z=45.0)
+        self._finish(optic)
+        # nothing is stored as a thickness
+        assert all(float(s.thickness) == 0.0 for s in optic.surfaces)
+        assert _thi(_encode(optic)) == [100.0, 5.0, 40.0, 0.0]
+
+    def test_absolute_z_with_object_at_infinity(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(
+            index=1,
+            radius=50.0,
+            z=0.0,
+            material=IdealMaterial(1.5),
+            is_stop=True,
+        )
+        optic.surfaces.add(index=2, radius=-50.0, z=5.0)
+        optic.surfaces.add(index=3, z=45.0)
+        self._finish(optic)
+        assert _thi(_encode(optic)) == [1e10, 5.0, 40.0, 0.0]
+
+    def test_thickness_solve_exported(self, set_test_backend):
+        optic = _make_lens()
+        optic.solves.add("marginal_ray_height", 2, height=0.0)
+        optic.solves.apply()
+        z = _gcs_z(optic)
+        with pytest.warns(UserWarning, match="solve"):
+            lines = _encode(optic)
+        written = _thi(lines)
+        assert_allclose(written[1], z[2] - z[1], rtol=1e-7)
+        assert_allclose(written[2], z[3] - z[2], rtol=1e-7)
+        # the solved value, not the thickness the surface was created with
+        assert abs(written[1] - 5.0) > 1.0
+
+    def test_float32_relative_lens_writes_exact_thicknesses(self):
+        torch = pytest.importorskip("torch")
+        import optiland.backend as be
+
+        be.set_backend("torch")
+        be.set_device("cpu")
+        be.set_precision("float32")
+        try:
+            optic = Optic()
+            optic.surfaces.add(index=0, thickness=float("inf"))
+            for i, t in enumerate([0.3, 10.1, 0.7, 123.456, 0.1], start=1):
+                optic.surfaces.add(
+                    index=i, radius=50.0 * (-1) ** i, thickness=t, is_stop=(i == 1)
+                )
+            optic.surfaces.add(index=6)
+            self._finish(optic)
+            assert optic.surfaces.global_z_positions.dtype == torch.float32
+            written = _thi(_encode(optic))
+        finally:
+            be.set_precision("float64")
+            be.set_backend("numpy")
+        # the attributes, not the float32 cumulative-sum differences
+        assert written == [1e10, 0.3, 10.1, 0.7, 123.456, 0.1, 0.0]
+
+    def test_thickness_attribute_preferred_only_within_tolerance(
+        self, set_test_backend
+    ):
+        optic = _make_lens()
+        # the vertex moved by 1e-3 while the attribute stayed at 5.0
+        optic.surfaces[2].geometry.cs.z = optic.surfaces[2].geometry.cs.z + 1e-3
+        assert _thi(_encode(optic))[1] == 5.001
+
+    @staticmethod
+    def _far_lens() -> Optic:
+        """Relative lens whose third vertex sits at z ~ 200 mm."""
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        for i, t in enumerate([200.0, 0.1, 3.0], start=1):
+            optic.surfaces.add(index=i, radius=50.0 * (-1) ** i, thickness=t)
+        optic.surfaces.add(index=4)
+        return optic
+
+    @pytest.mark.parametrize("dz", [1e-3, 2e-4, 1e-5, 1e-6])
+    def test_small_vertex_shift_at_z200_is_written(self, dz, set_test_backend):
+        optic = self._far_lens()
+        optic.surfaces[3].geometry.cs.z = optic.surfaces[3].geometry.cs.z + dz
+        spacings = OpticToCodeVConverter(optic)._vertex_spacings()
+        assert spacings[2] == pytest.approx(0.1 + dz, rel=0, abs=1e-10)
+        assert spacings[3] == pytest.approx(3.0 - dz, rel=0, abs=1e-10)
+
+    @pytest.mark.parametrize("gap", [1e-3, 2e-4, 1e-4, 1e-5])
+    def test_small_absolute_z_gap_at_z200_is_not_zeroed(self, gap, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(index=1, radius=50.0, z=200.0, is_stop=True)
+        optic.surfaces.add(index=2, radius=-50.0, z=200.0 + gap)
+        optic.surfaces.add(index=3, z=210.0)
+        assert all(float(s.thickness) == 0.0 for s in optic.surfaces[1:])
+        spacings = OpticToCodeVConverter(optic)._vertex_spacings()
+        assert spacings[1] == pytest.approx(gap, rel=0, abs=1e-10)
+
+    def test_relative_lens_unchanged(self, set_test_backend):
+        assert _thi(_encode(_make_lens())) == [1e10, 5.0, 45.0, 0.0]
+
+    def test_axial_mirror_negative_thickness(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(
+            index=1, radius=-100.0, thickness=-50.0, material="mirror", is_stop=True
+        )
+        optic.surfaces.add(index=2)
+        self._finish(optic)
+        z = _gcs_z(optic)
+        written = _thi(_encode(optic))
+        assert written[1] < 0
+        assert_allclose(written[1], z[2] - z[1], rtol=1e-7)
+
+    def test_mirror_then_lens_follows_the_fold_back(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(
+            index=1, radius=-100.0, thickness=-20.0, material="mirror", is_stop=True
+        )
+        optic.surfaces.add(index=2, thickness=-30.0)
+        optic.surfaces.add(index=3)
+        self._finish(optic)
+        z = _gcs_z(optic)
+        written = _thi(_encode(optic))
+        assert_allclose(written[1:3], [z[2] - z[1], z[3] - z[2]], rtol=1e-7)
+        assert written[1:3] == [-20.0, -30.0]
+
+    def test_no_negative_zero(self, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[2].geometry.cs.z = optic.surfaces[1].geometry.cs.z - 1e-14
+        lines = _thi_lines(_encode(optic))
+        assert all("-0 " not in line + " " for line in lines)
+        assert lines[1].split()[2] == "0"
+
+    @pytest.mark.parametrize(
+        "gap, expected",
+        [(1e-7, 1e-7), (1e-9, 1e-9), (2e-12, 2e-12), (5e-13, 0.0), (-5e-13, 0.0)],
+    )
+    def test_spacing_zeroed_only_below_1e_12(self, gap, expected, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[2].geometry.cs.z = optic.surfaces[1].geometry.cs.z + gap
+        token = _thi_lines(_encode(optic))[1].split()[2]
+        assert float(token) == pytest.approx(expected, rel=1e-6, abs=0.0)
+        if expected == 0.0:
+            assert token == "0"
+
+    def test_zeroing_boundary_is_inclusive_at_1e_12(self, set_test_backend):
+        optic = _make_lens()
+        base = optic.surfaces[1].geometry.cs.z
+        optic.surfaces[2].geometry.cs.z = base + 1e-12
+        # strictly below 1e-12 is zeroed; a spacing of exactly 1e-12 is written
+        assert OpticToCodeVConverter(optic)._vertex_spacings()[1] == 1e-12
+        optic.surfaces[2].geometry.cs.z = base + 1.0000001e-12
+        assert OpticToCodeVConverter(optic)._vertex_spacings()[1] > 1e-12
+
+    def test_empty_and_object_only_optics(self, set_test_backend):
+        assert OpticToCodeVConverter(Optic()).convert().surfaces == {}
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=7.0)
+        assert OpticToCodeVConverter(optic).convert().surfaces[0]["thickness"] == 7.0
+
+    def test_object_and_image_only(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=12.0)
+        optic.surfaces.add(index=1)
+        assert _thi(_encode(optic)) == [12.0, 0.0]
+
+    def test_samples_unchanged(self, set_test_backend):
+        import inspect
+        import math
+        import warnings
+
+        from optiland import samples
+
+        checked = 0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for module in vars(samples).values():
+                if not inspect.ismodule(module):
+                    continue
+                for cls in vars(module).values():
+                    if not (
+                        inspect.isclass(cls)
+                        and issubclass(cls, Optic)
+                        and cls.__module__ == module.__name__
+                    ):
+                        continue
+                    optic = cls()
+                    try:
+                        written = _thi(_encode(optic))
+                    except NotImplementedError:
+                        continue  # refused for another reason (asphere, ...)
+                    attributes = [float(s.thickness) for s in optic.surfaces]
+                    expected = [
+                        1e10 if math.isinf(t) else t for t in attributes[:-1]
+                    ] + [0.0]
+                    assert_allclose(written, expected, rtol=1e-6, atol=1e-9)
+                    checked += 1
+        assert checked >= 20
+
+
+# ---------------------------------------------------------------------------
+# The image surface keeps its radius; a conic or asphere there is refused
+# ---------------------------------------------------------------------------
+
+
+def _lens_with_image(**image) -> Optic:
+    """Object at infinity, one stop surface, and an image surface from ``image``."""
+    optic = Optic()
+    optic.surfaces.add(index=0, thickness=float("inf"))
+    optic.surfaces.add(index=1, radius=50.0, thickness=45.0, is_stop=True)
+    optic.surfaces.add(index=2, **image)
+    optic.set_aperture(aperture_type="EPD", value=10.0)
+    optic.fields.set_type("angle")
+    optic.fields.add(y=0.0)
+    optic.wavelengths.add(value=0.5876, is_primary=True)
+    return optic
+
+
+class TestImageSurface:
+    def test_planar_image_writes_zero_radius(self, set_test_backend):
+        lines = _encode(_lens_with_image())
+        assert [line for line in lines if line.startswith("SI")] == ["SI 0 0"]
+
+    @pytest.mark.parametrize("radius", [-70.0, 35.5])
+    def test_image_radius_written(self, radius, set_test_backend):
+        lines = _encode(_lens_with_image(radius=radius))
+        assert [line for line in lines if line.startswith("SI")] == [f"SI {radius:g} 0"]
+
+    def test_image_radius_does_not_change_other_lines(self, set_test_backend):
+        flat = _encode(_lens_with_image())
+        curved = _encode(_lens_with_image(radius=-70.0))
+        assert [line for line in flat if not line.startswith("SI")] == [
+            line for line in curved if not line.startswith("SI")
+        ]
+
+    @pytest.mark.parametrize(
+        "image, message",
+        [
+            ({"radius": -70.0, "conic": -0.5}, "an image surface conic"),
+            (
+                {"radius": -70.0, "surface_type": "even_asphere"},
+                "an aspheric image surface",
+            ),
+            (
+                {
+                    "radius": -70.0,
+                    "surface_type": "even_asphere",
+                    "coefficients": [1e-5],
+                },
+                "an aspheric image surface",
+            ),
+            (
+                {"surface_type": "biconic", "radius_x": -70.0, "radius_y": -60.0},
+                "image surface geometry 'Biconic'",
+            ),
+        ],
+    )
+    def test_image_geometry_refused_and_file_untouched(
+        self, image, message, tmp_path, set_test_backend
+    ):
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(
+            NotImplementedError,
+            match=rf"^Surface 2: {message} (cannot be exported to CODE V yet)$",
+        ):
+            save_codev_file(_lens_with_image(**image), str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_nan_image_conic_refused(self, set_test_backend):
+        with pytest.raises(NotImplementedError, match="image surface conic"):
+            _encode(_lens_with_image(radius=-70.0, conic=float("nan")))
+
+    @pytest.mark.parametrize("conic", [0.0, 1e-17, -1e-16, 1e-16])
+    def test_image_conic_up_to_the_tolerance_not_refused(self, conic, set_test_backend):
+        lines = _encode(_lens_with_image(radius=-70.0, conic=conic))
+        assert [line for line in lines if line.startswith("SI")] == ["SI -70 0"]
+
+    @pytest.mark.parametrize("conic", [1e-15, -1e-15, 1e-9, 1e-3])
+    def test_image_conic_above_the_tolerance_refused(self, conic, set_test_backend):
+        with pytest.raises(NotImplementedError, match="image surface conic"):
+            _encode(_lens_with_image(radius=-70.0, conic=conic))
+
+    def test_nonfinite_image_radius_raises(self, set_test_backend):
+        with pytest.raises(ValueError, match="Surface 2: non-finite radius"):
+            _encode(_lens_with_image(radius=float("nan")))
+
+    def test_object_only_optic_keeps_a_plane_image(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=5.0)
+        model = OpticToCodeVConverter(optic).convert()
+        assert model.surfaces[1]["radius"] == 0.0
+
+    @pytest.mark.parametrize(
+        "name, expected",
+        [
+            ("HubbleTelescope", "SI -635.38227 0"),
+            ("NavarroWideAngleEye", "SI -12 0"),
+        ],
+    )
+    def test_sample_image_radii(self, name, expected, set_test_backend):
+        import warnings
+
+        from optiland import samples
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lines = _encode(getattr(samples, name)())
+        assert [line for line in lines if line.startswith("SI")] == [expected]

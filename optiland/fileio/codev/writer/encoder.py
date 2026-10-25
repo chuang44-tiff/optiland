@@ -66,6 +66,23 @@ def _check_numbers(where: str, mapping: dict[str, Any]) -> None:
                 raise ValueError(f"{where}: non-finite {key} ({item!r})")
 
 
+def _check_private_glass(model: CodeVDataModel, where: str, name: str) -> None:
+    """Raise ``ValueError`` if a private glass has no usable index row."""
+    data = model.wavelengths.get("data", [])
+    row = model.private_glasses.get(name)
+    if row is None or len(row) != len(data):
+        raise ValueError(
+            f"{where}: private glass '{name}' needs one index per wavelength "
+            f"({len(data)}), found {None if row is None else len(row)}"
+        )
+    for n, i in zip(row, wavelength_write_order(model.wavelengths), strict=True):
+        if not math.isfinite(n):
+            raise ValueError(
+                f"{where}: non-finite index ({n!r}) of private glass '{name}' "
+                f"at {data[i] * 1000.0:.8g} nm"
+            )
+
+
 def _check_finite(model: CodeVDataModel) -> None:
     """Raise ``ValueError`` if any number in the model is not finite.
 
@@ -82,10 +99,31 @@ def _check_finite(model: CodeVDataModel) -> None:
         glass = raw.get("glass")
         if isinstance(glass, dict):
             _check_numbers(where, glass)
+            if "private" in glass:
+                _check_private_glass(model, where, glass["private"])
         r_max = getattr(raw.get("aperture"), "r_max", None)
         if r_max is not None and (math.isnan(r_max) or r_max == -math.inf):
             # +inf means "no limit" and is written as no CIR line
             raise ValueError(f"{where}: non-finite aperture r_max ({float(r_max)!r})")
+
+
+def wavelength_write_order(wl_data: dict[str, Any]) -> list[int]:
+    """Return the order in which the wavelengths are written to the file.
+
+    CODE V sorts ``WL`` into descending order and then applies ``REF`` and
+    ``WTW`` by position in the sorted list, so the writer sorts first and
+    permutes ``WTW`` and ``REF`` the same way. The sort is stable, so equal
+    wavelengths keep their relative order.
+
+    Args:
+        wl_data: ``CodeVDataModel.wavelengths``; ``"data"`` is in um.
+
+    Returns:
+        Indices into ``wl_data["data"]``, longest wavelength first. The model
+        itself is not reordered.
+    """
+    data = wl_data.get("data", [])
+    return sorted(range(len(data)), key=lambda i: -data[i])
 
 
 def _fmt_list(values: list[float]) -> str:
@@ -137,6 +175,7 @@ class CodeVFileEncoder:
         self._encode_aperture(lines)
         self._encode_wavelengths(lines)
         self._encode_fields(lines)
+        self._encode_private_catalog(lines)
         lines.append("")  # blank separator before surfaces
 
     def _encode_aperture(self, lines: list[str]) -> None:
@@ -153,18 +192,23 @@ class CodeVFileEncoder:
         data = wl_data.get("data", [])
         if not data:
             return
-        # Convert µm -> nm
-        nm_values = [v * 1000.0 for v in data]
-        lines.append("WL " + _fmt_list(nm_values))
+        order = wavelength_write_order(wl_data)
+        # Convert um -> nm
+        lines.append("WL " + _fmt_list([data[i] * 1000.0 for i in order]))
 
         weights = wl_data.get("weights")
         if weights:
-            lines.append("WTW " + _fmt_list(weights))
+            if len(weights) != len(data):
+                raise ValueError(
+                    f"header: {len(weights)} wavelength weights for "
+                    f"{len(data)} wavelengths"
+                )
+            lines.append("WTW " + _fmt_list([weights[i] for i in order]))
         else:
             lines.append("WTW " + " ".join(["1"] * len(data)))
 
         primary_index = wl_data.get("primary_index", 0)
-        lines.append(f"REF {primary_index + 1}")
+        lines.append(f"REF {order.index(primary_index) + 1}")
 
     def _encode_fields(self, lines: list[str]) -> None:
         fields = self._model.fields
@@ -183,6 +227,19 @@ class CodeVFileEncoder:
         weights = fields.get("weights")
         if weights and any(abs(w - 1.0) > 1e-12 for w in weights):
             lines.append("WTF " + _fmt_list(weights))
+
+    def _encode_private_catalog(self, lines: list[str]) -> None:
+        """Write the ``PRV`` block of private glasses, if there are any."""
+        glasses = self._model.private_glasses
+        if not glasses:
+            return
+        wl_data = self._model.wavelengths
+        order = wavelength_write_order(wl_data)
+        lines.append("PRV")
+        lines.append("  PWL " + _fmt_list([wl_data["data"][i] * 1000.0 for i in order]))
+        for name, indices in glasses.items():
+            lines.append(f"  '{name}' " + " ".join(f"{n:.10g}" for n in indices))
+        lines.append("END")
 
     # ------------------------------------------------------------------
     # Surface blocks
@@ -279,35 +336,18 @@ class CodeVFileEncoder:
             glass: Glass specification dict from the formatter.
 
         Returns:
-            Glass token string, e.g. ``"N-BK7_SCHOTT"`` or ``"1.5168:64.17"``.
+            Glass token string, e.g. ``"NBK7_SCHOTT"``, ``"REFL"`` or the quoted
+            private glass name ``"'OPT1'"``.
         """
+        if "private" in glass:
+            return f"'{glass['private']}'"
+
         name = glass.get("name", "")
 
         if name == "REFL":
             return "REFL"
 
-        if "nd" in glass and "vd" in glass:
-            # Fictitious glass: Nd:Vd format
-            nd = glass["nd"]
-            vd = glass["vd"]
-            return f"{nd:.6f}:{vd:.4f}"
-
         catalog = glass.get("catalog")
         if catalog:
             return f"{name}_{catalog}"
         return name
-
-    def _encode_glass_comment(self, glass: dict[str, Any]) -> str | None:
-        """Return an optional comment string for a glass.
-
-        Args:
-            glass: Glass specification dict.
-
-        Returns:
-            A comment string or None.
-        """
-        if not glass:
-            return None
-        if "nd" in glass and "vd" in glass:
-            return f"! Fictitious glass: Nd={glass['nd']:.6f}, Vd={glass['vd']:.2f}"
-        return None
