@@ -92,3 +92,33 @@ def codev_glass_name(mat: Any) -> tuple[str, str] | None:
     if not isinstance(filename, str):
         return None
     return codev_name_for_filename(filename)
+
+
+def wavelength_outside_range(
+    mat: Any, wavelengths: list[float]
+) -> tuple[float, float, float] | None:
+    """Return the first wavelength outside the data range of a catalog material.
+
+    CODE V aborts the load when a system wavelength lies outside the range of a
+    catalog glass, so such a glass cannot be named.
+
+    Args:
+        mat: A surface material.
+        wavelengths: System wavelengths in um, in the order to be checked.
+
+    Returns:
+        ``(wavelength, min_wavelength, max_wavelength)`` in um for the first
+        wavelength outside ``[min_wavelength, max_wavelength]`` (both ends are
+        inside), or ``None`` if all are inside or the material records no range.
+    """
+    data = getattr(mat, "material_data", None)
+    if not isinstance(data, dict):
+        return None
+    low = data.get("min_wavelength")
+    high = data.get("max_wavelength")
+    low = float("-inf") if low is None else float(low)
+    high = float("inf") if high is None else float(high)
+    for wavelength in wavelengths:
+        if not low <= wavelength <= high:
+            return wavelength, low, high
+    return None

@@ -55,6 +55,16 @@ def _make_singlet() -> Optic:
     return optic
 
 
+def _complete(optic: Optic) -> Optic:
+    """Give a hand-built optic the aperture, field and wavelength CODE V needs."""
+    optic.set_aperture(aperture_type="EPD", value=10.0)
+    optic.fields.set_type("angle")
+    optic.fields.add(y=0.0)
+    if not len(optic.wavelengths):
+        optic.wavelengths.add(value=0.5876, is_primary=True)
+    return optic
+
+
 def _make_conic_sphere(conic: float = 0.0, material=None) -> Optic:
     """Singlet built in code (no reader) with a conic and any surface-1 material."""
     from optiland.materials import IdealMaterial
@@ -393,13 +403,17 @@ class TestOpticToCodeVConverterExtended:
 
         optic = Optic()
         # Add 3 surfaces: Obj, Real, Img
-        optic.surfaces.add(index=0, thickness=0.0)
+        optic.surfaces.add(index=0, thickness=10.0)
         optic.surfaces.add(
-            index=1, radius=50.0, thickness=5.0, material=IdealMaterial(1.7)
+            index=1,
+            radius=50.0,
+            thickness=5.0,
+            material=IdealMaterial(1.7),
+            is_stop=True,
         )
         optic.surfaces.add(index=2, thickness=0.0)
         optic.add_wavelength(0.5876, is_primary=True)
-        conv = OpticToCodeVConverter(optic)
+        conv = OpticToCodeVConverter(_complete(optic))
         with pytest.warns(UserWarning, match="private glass"):
             model = conv.convert()
         # Obj(0) + Surf(1) + Img(2)
@@ -409,9 +423,16 @@ class TestOpticToCodeVConverterExtended:
     def test_reflective_surface_codev(self):
         optic = Optic()
         # Add object and reflective surface
-        optic.surfaces.add(index=0, thickness=0.0)
-        optic.surfaces.add(index=1, radius=100.0, thickness=-50.0, material="mirror")
+        optic.surfaces.add(index=0, thickness=10.0)
+        optic.surfaces.add(
+            index=1,
+            radius=100.0,
+            thickness=-50.0,
+            material="mirror",
+            is_stop=True,
+        )
         optic.surfaces.add(index=2, thickness=0.0)
+        _complete(optic)
         conv = OpticToCodeVConverter(optic)
         model = conv.convert()
         assert model.surfaces[1]["glass"]["name"] == "REFL"
@@ -933,9 +954,16 @@ class TestInteractionRefusal:
         lines = _encode(_make_lens())
         assert not any(line.strip().startswith("MFL") for line in lines)
         optic = Optic()
-        optic.surfaces.add(index=0, thickness=0.0)
-        optic.surfaces.add(index=1, radius=100.0, thickness=-50.0, material="mirror")
+        optic.surfaces.add(index=0, thickness=10.0)
+        optic.surfaces.add(
+            index=1,
+            radius=100.0,
+            thickness=-50.0,
+            material="mirror",
+            is_stop=True,
+        )
         optic.surfaces.add(index=2, thickness=0.0)
+        _complete(optic)
         assert any("REFL" in line for line in _encode(optic))
 
 
@@ -1266,8 +1294,7 @@ class TestPrivateGlass:
         path.write_bytes(b"previous design")
         with pytest.raises(
             ValueError,
-            match=r"Surface 1: material .* needs a private glass but the system "
-            r"has no wavelengths",
+            match="The optic has no wavelengths",
         ):
             save_codev_file(optic, str(path))
         assert path.read_bytes() == b"previous design"
@@ -1540,7 +1567,7 @@ class TestOffsetRefusal:
         optic.surfaces.add(index=0, thickness=float("inf"))
         optic.surfaces.add(index=1, radius=50.0, z=0.0, is_stop=True)
         optic.surfaces.add(index=2, z=30.0)
-        self._converter(optic).convert()
+        self._converter(_complete(optic)).convert()
 
     def test_empty_and_object_only_optics_not_refused(self, set_test_backend):
         assert self._converter(Optic()).convert().surfaces == {}
@@ -2264,3 +2291,655 @@ class TestCountLimits:
         with pytest.raises(ValueError, match=message):
             save_codev_file(optic, str(path))
         assert path.read_bytes() == b"previous design"
+
+
+# ---------------------------------------------------------------------------
+# The aperture stop: one STO, on the surface Optiland resolves as the stop
+# ---------------------------------------------------------------------------
+
+
+def _sto_surfaces(lines: list[str]) -> list[int]:
+    """Return the output surface numbers (0 = object) followed by an ``STO``."""
+    numbers = []
+    surface = -1
+    for line in lines:
+        if line.startswith(("SO ", "S ", "SI ")):
+            surface += 1
+        elif line.strip() == "STO":
+            numbers.append(surface)
+    return numbers
+
+
+class TestStopSurface:
+    def test_single_stop_is_written_once(self, set_test_backend):
+        assert _sto_surfaces(_encode(_make_lens())) == [1]
+
+    def test_several_flags_write_sto_only_at_stop_index(self, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces[2].is_stop = True  # a second flagged surface
+        assert [s.is_stop for s in optic.surfaces] == [False, True, True, False]
+        stop_index = optic.surfaces.stop_index
+        assert stop_index == 1
+        assert _sto_surfaces(_encode(optic)) == [stop_index]
+
+    def test_stop_follows_stop_index_setter(self, set_test_backend):
+        optic = _make_lens()
+        optic.surfaces.stop_index = 2
+        assert _sto_surfaces(_encode(optic)) == [2]
+
+    @pytest.mark.parametrize("which", ["no stop", "object", "image"])
+    def test_refused_stop_leaves_existing_file_untouched(
+        self, which, tmp_path, set_test_backend
+    ):
+        optic = _make_lens()
+        optic.surfaces[1].is_stop = False
+        if which == "object":
+            optic.surfaces[0].is_stop = True
+            match = r"Surface 0: the aperture stop on the object surface cannot be"
+            error = NotImplementedError
+        elif which == "image":
+            optic.surfaces[-1].is_stop = True
+            match = r"Surface 3: the aperture stop on the image surface cannot be"
+            error = NotImplementedError
+        else:
+            match = "no aperture stop surface"
+            error = ValueError
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(error, match=match):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_optic_without_real_surface_needs_no_stop(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=1.0)
+        optic.surfaces.add(index=1)
+        assert _sto_surfaces(_encode(optic)) == []
+
+
+# ---------------------------------------------------------------------------
+# imageFNO at a finite object is written as a fixed EPD (CODE V reads FNO as
+# the working F-number there)
+# ---------------------------------------------------------------------------
+
+
+class TestImageFnoFiniteObject:
+    @staticmethod
+    def _fno_lens(object_thickness: float) -> Optic:
+        optic = _make_lens(object_thickness=object_thickness)
+        optic.set_aperture(aperture_type="imageFNO", value=4.0)
+        return optic
+
+    def test_finite_object_writes_epd_with_warning(self, set_test_backend):
+        import optiland.backend as be
+
+        optic = self._fno_lens(300.0)
+        with pytest.warns(UserWarning, match=r"imageFNO .* finite distance .* EPD"):
+            lines = _encode(optic)
+        epd = float(be.to_numpy(optic.paraxial.EPD()))
+        epd_lines = [line for line in lines if line.startswith("EPD ")]
+        assert len(epd_lines) == 1
+        assert_allclose(float(epd_lines[0].split()[1]), epd, rtol=1e-12)
+        assert not any(line.startswith("FNO") for line in lines)
+
+    def test_finite_object_epd_has_full_precision(self, set_test_backend):
+        import optiland.backend as be
+
+        optic = self._fno_lens(300.0)
+        with pytest.warns(UserWarning, match="imageFNO"):
+            model = OpticToCodeVConverter(optic).convert()
+        assert model.aperture == {"EPD": float(be.to_numpy(optic.paraxial.EPD()))}
+
+    def test_infinite_object_keeps_fno(self, set_test_backend, recwarn):
+        lines = _encode(self._fno_lens(float("inf")))
+        assert "FNO 4" in lines
+        assert not any(line.startswith("EPD") for line in lines)
+        assert not [w for w in recwarn if "imageFNO" in str(w.message)]
+
+    def test_object_at_codev_infinity_keeps_fno(self, set_test_backend):
+        assert "FNO 4" in _encode(self._fno_lens(1e10))
+
+    def test_epd_aperture_at_finite_object_is_silent(self, set_test_backend, recwarn):
+        lines = _encode(_make_lens(object_thickness=300.0))
+        assert "EPD 10" in lines
+        assert not [w for w in recwarn if "imageFNO" in str(w.message)]
+
+
+# ---------------------------------------------------------------------------
+# A catalog glass is named only if every system wavelength is in its range
+# ---------------------------------------------------------------------------
+
+
+class TestGlassWavelengthRange:
+    @staticmethod
+    def _lens(*wavelengths: float) -> Optic:
+        optic = _make_lens()
+        optic.wavelengths.wavelengths.clear()
+        for i, wavelength in enumerate(wavelengths):
+            optic.wavelengths.add(value=wavelength, is_primary=i == 0)
+        return optic
+
+    @staticmethod
+    def _s1(lines: list[str]) -> str:
+        return next(line for line in lines if line.startswith("S ") and "BK7" in line)
+
+    def test_range_comes_from_the_material(self, set_test_backend):
+        from optiland.materials import Material
+
+        data = Material("N-BK7", "schott").material_data
+        assert (data["min_wavelength"], data["max_wavelength"]) == (0.3, 2.5)
+
+    @pytest.mark.parametrize("wavelength", [0.3, 0.5876, 2.5])
+    def test_inside_the_range_is_named(self, wavelength, set_test_backend, recwarn):
+        lines = _encode(self._lens(wavelength))
+        assert self._s1(lines).endswith("NBK7_SCHOTT")
+        assert "PRV" not in lines
+        assert not [w for w in recwarn if "private glass" in str(w.message)]
+
+    @pytest.mark.parametrize("wavelength", [10.6, 0.25, 2.5000001, 0.2999999])
+    def test_outside_the_range_is_written_private(self, wavelength, set_test_backend):
+        import optiland.backend as be
+        from optiland.materials import Material
+
+        optic = self._lens(0.5876, wavelength)
+        with pytest.warns(UserWarning) as record:
+            lines = _encode(optic)
+        messages = [str(w.message) for w in record]
+        assert any(
+            "N-BK7" in m and f"{wavelength:.8g} um" in m and "abort" in m
+            for m in messages
+        )
+        assert any("private glass 'OPT1'" in m for m in messages)
+        assert "BK7" not in " ".join(line for line in lines if line.startswith("S "))
+        assert _glass_token(_surface_lines(lines)[0]) == "'OPT1'"
+        n = [
+            float(be.to_numpy(Material("N-BK7", "schott").n(w)))
+            for w in sorted((0.5876, wavelength), reverse=True)
+        ]
+        row = next(line for line in lines if line.startswith("  'OPT1'"))
+        assert_allclose([float(v) for v in row.split()[1:]], n, rtol=1e-9)
+
+    def test_out_of_range_glass_is_not_called_unnamed(self, set_test_backend):
+        with pytest.warns(UserWarning) as record:
+            _encode(self._lens(0.5876, 10.6))
+        messages = [str(w.message) for w in record]
+        assert not [m for m in messages if "no verified" in m]
+        (private,) = [m for m in messages if "private glass 'OPT1'" in m]
+        assert "catalog range does not cover them" in private
+        assert len([m for m in messages if "N-BK7" in m and "abort" in m]) == 1
+
+    def test_unnamed_glass_still_says_it_has_no_catalog_entry(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        optic = _make_lens()
+        optic.surfaces[1].material_post = IdealMaterial(1.5)
+        with pytest.warns(UserWarning, match="no verified CODE V catalog entry"):
+            _encode(optic)
+
+    def test_only_the_glass_out_of_range_becomes_private(self, set_test_backend):
+        from optiland.materials import Material
+
+        # 0.31 um: inside N-BK7 (0.3 to 2.5) and outside N-LAK9 (0.32 to 2.5)
+        optic = _make_lens()
+        optic.wavelengths.add(value=0.31)
+        optic.surfaces[2].material_post = Material("N-LAK9", "schott")
+        with pytest.warns(UserWarning, match="N-LAK9") as record:
+            lines = _encode(optic)
+        assert not [w for w in record if "'N-BK7'" in str(w.message)]
+        tokens = [_glass_token(line) for line in _surface_lines(lines)]
+        assert tokens[0] == "NBK7_SCHOTT"
+        assert tokens[1] == "'OPT1'"
+
+
+# ---------------------------------------------------------------------------
+# Object-space telecentric optics are written with TEL Y
+# ---------------------------------------------------------------------------
+
+
+class TestTelecentric:
+    def test_tel_y_written_before_the_aperture(self, set_test_backend):
+        optic = _make_lens()
+        optic.obj_space_telecentric = True
+        lines = _encode(optic)
+        assert lines.count("TEL Y") == 1
+        assert lines.index("TEL Y") + 1 == lines.index("EPD 10")
+
+    def test_tel_y_written_before_a_na_aperture(self, set_test_backend):
+        optic = _make_lens(object_thickness=100.0)
+        optic.set_aperture(aperture_type="objectNA", value=0.1)
+        optic.obj_space_telecentric = True
+        lines = _encode(optic)
+        assert lines.index("TEL Y") + 1 == lines.index("NAO 0.1")
+
+    def test_non_telecentric_has_no_tel_line(self, set_test_backend):
+        optic = _make_lens()
+        assert optic.obj_space_telecentric is False
+        lines = _encode(optic)
+        assert any(line.startswith("SO ") for line in lines)
+        assert not any(line.startswith("TEL") for line in lines)
+
+    def test_uv_projection_lens_exports(self, tmp_path, set_test_backend):
+        import warnings
+
+        from optiland.samples.lithography import UVProjectionLens
+
+        path = tmp_path / "uv.seq"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            save_codev_file(UVProjectionLens(), str(path))
+        assert "TEL Y" in path.read_text().splitlines()
+
+
+# ---------------------------------------------------------------------------
+# A vertex spacing must agree with the light direction set by the mirrors
+# ---------------------------------------------------------------------------
+
+
+class TestSpacingDirection:
+    @staticmethod
+    def _finish(optic: Optic) -> Optic:
+        optic.set_aperture(aperture_type="EPD", value=10.0)
+        optic.fields.set_type("angle")
+        optic.fields.add(y=0.0)
+        optic.wavelengths.add(value=0.5876, is_primary=True)
+        return optic
+
+    def _backwards_lens(self) -> Optic:
+        """Absolute-z lens whose vertices descend with no mirror."""
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, z=10.0)
+        optic.surfaces.add(
+            index=1, radius=50.0, z=0.0, material=IdealMaterial(1.5), is_stop=True
+        )
+        optic.surfaces.add(index=2, radius=-50.0, z=-5.0)
+        optic.surfaces.add(index=3, z=-60.0)
+        return self._finish(optic)
+
+    def test_negative_spacing_without_a_mirror_refused(
+        self, tmp_path, set_test_backend
+    ):
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(
+            NotImplementedError,
+            match=r"Surface 1: Optiland starts the light out travelling in -z",
+        ):
+            save_codev_file(self._backwards_lens(), str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_negative_first_gap_after_an_infinite_object_exports(
+        self, set_test_backend
+    ):
+        """Optiland enters +z from an infinite object whatever the gaps are."""
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(
+            index=1,
+            radius=50.0,
+            thickness=-5.0,
+            material=IdealMaterial(1.5),
+            is_stop=True,
+        )
+        optic.surfaces.add(index=2, radius=-50.0, thickness=-45.0)
+        optic.surfaces.add(index=3)
+        assert _thi(_encode(self._finish(optic))) == [1e10, -5.0, -45.0, 0.0]
+
+    def test_negative_gap_after_the_first_spacing_exports(self, set_test_backend):
+        """A negative gap inside a lens (Microscope20x cover glass) is written."""
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(
+            index=1,
+            radius=50.0,
+            thickness=5.0,
+            material=IdealMaterial(1.5),
+            is_stop=True,
+        )
+        optic.surfaces.add(index=2, radius=-50.0, thickness=-1.0)
+        optic.surfaces.add(index=3, thickness=46.0)
+        optic.surfaces.add(index=4)
+        assert _thi(_encode(self._finish(optic))) == [1e10, 5.0, -1.0, 46.0, 0.0]
+
+    def test_microscope20x_exports_with_global_z_spacings(
+        self, tmp_path, set_test_backend
+    ):
+        import warnings
+
+        from optiland.samples.microscopes import Microscope20x
+
+        optic = Microscope20x()
+        path = tmp_path / "m.seq"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            save_codev_file(optic, str(path))
+        thi = _thi(path.read_text().splitlines())
+        z = _gcs_z(optic)
+        assert any(t < 0 for t in thi[1:])
+        for t, z0, z1 in zip(thi[1:], z[1:], z[2:], strict=False):
+            assert t == pytest.approx(z1 - z0, abs=1e-9)
+
+    def test_hubble_telescope_still_exports(self, tmp_path, set_test_backend):
+        import warnings
+
+        from optiland.samples.telescopes import HubbleTelescope
+
+        path = tmp_path / "h.seq"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            save_codev_file(HubbleTelescope(), str(path))
+        assert any(t < 0 for t in _thi(path.read_text().splitlines()))
+
+    def test_mirror_systems_and_zero_gaps_still_export(self, set_test_backend):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(
+            index=1, radius=-100.0, thickness=-50.0, material="mirror", is_stop=True
+        )
+        optic.surfaces.add(index=2, radius=100.0, thickness=50.0, material="mirror")
+        optic.surfaces.add(index=3, thickness=0.0)
+        optic.surfaces.add(index=4)
+        assert _thi(_encode(self._finish(optic))) == [1e10, -50.0, 50.0, 0.0, 0.0]
+
+    def test_virtual_object_exports(self, set_test_backend):
+        """Object past surface 1, light still travelling +z (CODE V: SO 0 -10)."""
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, z=10.0)
+        optic.surfaces.add(
+            index=1, radius=50.0, z=0.0, material=IdealMaterial(1.5), is_stop=True
+        )
+        optic.surfaces.add(index=2, radius=-50.0, z=5.0)
+        optic.surfaces.add(index=3, z=50.0)
+        lines = _encode(self._finish(optic))
+        assert "SO 0 -10" in lines
+        assert _thi(lines) == [-10.0, 5.0, 45.0, 0.0]
+
+    def test_virtual_object_then_backwards_spacing_still_refused(
+        self, set_test_backend
+    ):
+        optic = self._backwards_lens()
+        with pytest.raises(NotImplementedError, match="Surface 1: Optiland starts"):
+            _encode(optic)
+
+    def _stop_dummy_lens(self, object_thickness: float, dummy_gap: float) -> Optic:
+        """Object, a plano stop dummy, then R50 / 5 / n1.5 and R-50 / 45."""
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=object_thickness)
+        optic.surfaces.add(index=1, thickness=dummy_gap, is_stop=True)
+        optic.surfaces.add(
+            index=2, radius=50.0, thickness=5.0, material=IdealMaterial(1.5)
+        )
+        optic.surfaces.add(index=3, radius=-50.0, thickness=45.0)
+        optic.surfaces.add(index=4)
+        return self._finish(optic)
+
+    @pytest.mark.parametrize("object_thickness", [float("inf"), 100.0])
+    def test_stop_dummy_behind_the_lens_exports(
+        self, object_thickness, set_test_backend
+    ):
+        """Optiland travels +z, so it is written (CODE V gives the same EFL)."""
+        optic = self._stop_dummy_lens(object_thickness, -10.0)
+        thi = _thi(_encode(optic))
+        assert thi == [1e10 if object_thickness == float("inf") else 100.0] + [
+            -10.0,
+            5.0,
+            45.0,
+            0.0,
+        ]
+
+    def test_virtual_object_then_a_zero_dummy_is_refused(self, set_test_backend):
+        """The virtual-object override does not fire, so Optiland travels -z."""
+        optic = self._stop_dummy_lens(-10.0, 0.0)
+        with pytest.raises(NotImplementedError, match="Surface 1: Optiland starts"):
+            _encode(optic)
+
+    def test_mirror_first_with_a_negative_gap_before_it_exports(self, set_test_backend):
+        """Infinite object: Optiland enters +z, the -20 before a mirror is written."""
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(index=1, thickness=-20.0, is_stop=True)
+        optic.surfaces.add(index=2, radius=-100.0, thickness=-50.0, material="mirror")
+        optic.surfaces.add(index=3)
+        assert _thi(_encode(self._finish(optic))) == [1e10, -20.0, -50.0, 0.0]
+
+    def _after_a_dummy_surface(self, first_gap: float) -> Optic:
+        """Infinite object, a zero-thickness dummy surface, then a real lens."""
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        optic.surfaces.add(index=1, thickness=0.0)
+        optic.surfaces.add(
+            index=2,
+            radius=50.0,
+            thickness=first_gap,
+            material=IdealMaterial(1.5),
+            is_stop=True,
+        )
+        optic.surfaces.add(index=3, radius=-50.0, thickness=45.0)
+        optic.surfaces.add(index=4)
+        return self._finish(optic)
+
+    def test_zero_spacing_is_skipped_before_a_positive_lens(self, set_test_backend):
+        optic = self._after_a_dummy_surface(5.0)
+        assert _thi(_encode(optic)) == [1e10, 0.0, 5.0, 45.0, 0.0]
+
+    def test_zero_spacing_dummy_then_a_negative_first_gap_exports(
+        self, set_test_backend
+    ):
+        """Infinite object: Optiland enters +z, the -3 after the dummy is written."""
+        optic = self._after_a_dummy_surface(-3.0)
+        assert _thi(_encode(optic)) == [1e10, 0.0, -3.0, 45.0, 0.0]
+
+    def test_infinite_object_distance_is_not_checked(self, set_test_backend):
+        assert _thi(_encode(_make_lens()))[0] == 1e10
+
+
+# ---------------------------------------------------------------------------
+# A curved object surface is refused
+# ---------------------------------------------------------------------------
+
+
+class TestObjectSurfaceShape:
+    @staticmethod
+    def _lens_with_object(**kwargs) -> Optic:
+        from optiland.materials import IdealMaterial
+
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=100.0, **kwargs)
+        optic.surfaces.add(
+            index=1,
+            radius=50.0,
+            thickness=5.0,
+            material=IdealMaterial(1.5),
+            is_stop=True,
+        )
+        optic.surfaces.add(index=2, radius=-50.0, thickness=45.0)
+        optic.surfaces.add(index=3)
+        optic.set_aperture(aperture_type="EPD", value=10.0)
+        optic.fields.set_type("angle")
+        optic.fields.add(y=0.0)
+        optic.wavelengths.add(value=0.5876, is_primary=True)
+        return optic
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"radius": 100.0},
+            {"radius": -100.0},
+            {"surface_type": "even_asphere", "radius": 100.0, "coefficients": [0.0]},
+        ],
+    )
+    def test_curved_object_refused_and_file_untouched(
+        self, kwargs, tmp_path, set_test_backend
+    ):
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(
+            NotImplementedError,
+            match="Surface 0: a curved object surface cannot be exported to CODE V",
+        ):
+            save_codev_file(self._lens_with_object(**kwargs), str(path))
+        assert path.read_bytes() == b"previous design"
+
+    @pytest.mark.parametrize("kwargs", [{}, {"radius": float("inf")}])
+    def test_plane_object_exported(self, kwargs, set_test_backend):
+        lines = _encode(self._lens_with_object(**kwargs))
+        assert next(line for line in lines if line.startswith("SO ")) == "SO 0 100"
+
+
+# ---------------------------------------------------------------------------
+# Wavelength validity: positive values and Optiland's own primary
+# ---------------------------------------------------------------------------
+
+
+class TestWavelengthValidity:
+    @pytest.mark.parametrize("value", [0.0, -0.55])
+    def test_non_positive_wavelength_refused(self, value, tmp_path, set_test_backend):
+        optic = _make_lens()
+        optic.wavelengths.add(value=value)
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(ValueError, match="wavelength 2 is not positive"):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_no_primary_wavelength_refused(self, tmp_path, set_test_backend):
+        optic = _make_lens()
+        optic.wavelengths[0].is_primary = False
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(ValueError, match="no primary wavelength"):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_several_flagged_primaries_use_optilands_primary(self, set_test_backend):
+        optic = _make_lens()
+        optic.wavelengths.add(value=0.4861)
+        optic.wavelengths[1].is_primary = True  # both flagged
+        assert optic.wavelengths.primary_index == 0
+        lines = _encode(optic)
+        wl = next(line for line in lines if line.startswith("WL ")).split()[1:]
+        ref = int(next(line for line in lines if line.startswith("REF ")).split()[1])
+        assert_allclose(
+            float(wl[ref - 1]), optic.wavelengths.primary_wavelength.value * 1000.0
+        )
+        assert OpticToCodeVConverter(optic).convert().wavelengths["primary_index"] == 0
+
+    def test_single_primary_unchanged(self, set_test_backend):
+        optic = _make_lens()
+        optic.wavelengths.add(value=0.4861)
+        optic.wavelengths.add(value=0.6563, is_primary=True)
+        lines = _encode(optic)
+        assert "WL 656.3 587.6 486.1" in lines
+        ref = int(next(line for line in lines if line.startswith("REF ")).split()[1])
+        assert ref == 1
+
+
+# ---------------------------------------------------------------------------
+# System sanity: aperture, fields, wavelengths, objectNA and the object distance
+# ---------------------------------------------------------------------------
+
+
+class TestSystemSanity:
+    @staticmethod
+    def _refused(optic: Optic, match: str, tmp_path) -> None:
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(ValueError, match=match):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_no_aperture_refused(self, tmp_path, set_test_backend):
+        optic = _make_lens()
+        optic.aperture = None
+        self._refused(optic, "no aperture set", tmp_path)
+
+    def test_no_fields_refused(self, tmp_path, set_test_backend):
+        optic = _make_lens()
+        optic.fields.fields.clear()
+        self._refused(optic, "no fields", tmp_path)
+
+    def test_no_wavelengths_refused(self, tmp_path, set_test_backend):
+        optic = _make_lens()
+        optic.wavelengths.wavelengths.clear()
+        self._refused(optic, "no wavelengths", tmp_path)
+
+    @pytest.mark.parametrize("value", [1.0, 1.5])
+    def test_object_na_of_one_or_more_refused(self, value, tmp_path, set_test_backend):
+        optic = _make_lens(object_thickness=100.0)
+        optic.set_aperture(aperture_type="objectNA", value=value)
+        self._refused(optic, r"objectNA .* not below 1 in air", tmp_path)
+
+    def test_object_na_below_one_exported(self, set_test_backend):
+        optic = _make_lens(object_thickness=100.0)
+        optic.set_aperture(aperture_type="objectNA", value=0.99)
+        assert "NAO 0.99" in _encode(optic)
+
+    @pytest.mark.parametrize("value", [1.0, 1.5])
+    def test_object_na_refused_without_a_real_surface(
+        self, value, tmp_path, set_test_backend
+    ):
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=12.0)
+        optic.surfaces.add(index=1)
+        optic.set_aperture(aperture_type="objectNA", value=value)
+        self._refused(optic, r"objectNA .* not below 1 in air", tmp_path)
+
+    def test_object_distance_zero_refused(self, tmp_path, set_test_backend):
+        self._refused(
+            _make_lens(object_thickness=0.0),
+            "object distance of 0 cannot be exported",
+            tmp_path,
+        )
+
+    def test_small_object_distance_is_exported(self, set_test_backend):
+        lines = _encode(_make_lens(object_thickness=1e-3))
+        assert next(line for line in lines if line.startswith("SO ")) == "SO 0 0.001"
+
+    def test_optics_without_a_real_surface_are_not_refused(self, set_test_backend):
+        assert OpticToCodeVConverter(Optic()).convert().surfaces == {}
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=12.0)
+        optic.surfaces.add(index=1)
+        assert _thi(_encode(optic)) == [12.0, 0.0]
+
+
+# ---------------------------------------------------------------------------
+# TITLE: a quote or a line break must not cut the title
+# ---------------------------------------------------------------------------
+
+
+class TestTitleQuoting:
+    @pytest.mark.parametrize(
+        ("name", "title"),
+        [
+            ("Cooke triplet", "Cooke triplet"),
+            ("Smith's doublet", 'Smith"s doublet'),
+            ("'quoted'", '"quoted"'),
+            ("line one\nline two", "line one line two"),
+            ("a\r\nb\rc", "a b c"),
+        ],
+    )
+    def test_title_survives(self, name, title, set_test_backend):
+        optic = _make_lens()
+        optic.name = name
+        lines = _encode(optic)
+        assert f"TITLE '{title}'" in lines
+        title_line = next(line for line in lines if line.startswith("TITLE"))
+        assert title_line.count("'") == 2
+
+    @pytest.mark.parametrize("name", [None, "", "\n"])
+    def test_no_title_line_without_a_name(self, name, set_test_backend):
+        optic = _make_lens()
+        optic.name = name
+        assert not any(line.startswith("TITLE") for line in _encode(optic))

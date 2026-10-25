@@ -21,7 +21,10 @@ from optiland.fileio.codev.surfaces import (
     get_handler_for_optiland_type,
 )
 from optiland.fileio.codev.writer.encoder import wavelength_write_order
-from optiland.fileio.codev.writer.glass_names import codev_glass_name
+from optiland.fileio.codev.writer.glass_names import (
+    codev_glass_name,
+    wavelength_outside_range,
+)
 from optiland.fileio.common import (
     FIELD_CLASS_TO_TYPE,
     field_type_string,
@@ -96,6 +99,7 @@ class OpticToCodeVConverter:
         # private glasses of the conversion in progress: formatted index row -> name
         self._private: dict[tuple[str, ...], str] = {}
         self._private_model: CodeVDataModel | None = None
+        self._stop_index: int | None = None
 
     def convert(self) -> CodeVDataModel:
         """Build and return the CodeVDataModel for the optic.
@@ -107,6 +111,11 @@ class OpticToCodeVConverter:
         self._check_object_medium()
         self._check_offsets()
         self._check_counts()
+        self._check_system()
+        self._check_wavelengths()
+        self._check_object_surface()
+        self._check_stop()
+        self._check_spacing_directions()
         model = CodeVDataModel()
         model.name = self._optic.name
         model.radius_mode = True  # always write radii
@@ -146,6 +155,131 @@ class OpticToCodeVConverter:
                 f"this optic has {n_fields}"
             )
 
+    def _check_system(self) -> None:
+        """Refuse a system CODE V cannot load: missing data or an unusable object.
+
+        An optic with no real surface (no more than an object and an image) is
+        only checked for ``objectNA`` and the object distance.
+
+        Raises:
+            ValueError: If an optic with a real surface has no aperture, no
+                fields or no wavelengths; if ``objectNA`` is 1 or more (the
+                object is in air); or if the object distance is exactly 0 (the
+                object would coincide with the entrance pupil).
+        """
+        optic = self._optic
+        ap = optic.aperture
+        if len(optic.surfaces) > 2 and ap is None:
+            raise ValueError("The optic has no aperture set; CODE V needs one")
+        if ap is not None and ap.ap_type == "objectNA" and float(ap.value) >= 1.0:
+            raise ValueError(
+                f"objectNA {float(ap.value):.8g} is not below 1 in air; "
+                "CODE V rejects it (NAO impossibly large)"
+            )
+        if len(optic.surfaces) > 2:
+            if optic.fields.num_fields == 0:
+                raise ValueError("The optic has no fields; CODE V needs at least one")
+            if len(optic.wavelengths) == 0:
+                raise ValueError(
+                    "The optic has no wavelengths; CODE V needs at least one"
+                )
+        spacings = self._vertex_spacings()
+        if spacings and spacings[0] == 0.0:
+            raise ValueError(
+                "Surface 0: an object distance of 0 cannot be exported to CODE V "
+                "(the entrance pupil and the object would be at the same location)"
+            )
+
+    def _check_wavelengths(self) -> None:
+        """Refuse a non-positive wavelength or a system with no primary wavelength.
+
+        Raises:
+            ValueError: If a wavelength is zero or negative, or no wavelength is
+                flagged primary.
+        """
+        wavelengths = self._optic.wavelengths
+        for i, w in enumerate(wavelengths):
+            value = float(w.value)
+            if value <= 0.0:  # NaN and inf are refused by the encoder
+                raise ValueError(
+                    f"header: wavelength {i + 1} is not positive ({value!r} um)"
+                )
+        if len(wavelengths) and not any(w.is_primary for w in wavelengths):
+            raise ValueError("header: the optic has no primary wavelength")
+
+    def _check_object_surface(self) -> None:
+        """Refuse a curved object surface (``SO`` is written with radius 0).
+
+        Raises:
+            NotImplementedError: If the object surface is not a plane.
+        """
+        surfaces = list(self._optic.surfaces)
+        if not surfaces:
+            return
+        geom = surfaces[0].geometry
+        radius = _scalar(getattr(geom, "radius", math.inf))
+        if str(geom) not in ("Planar", "Standard") or not math.isinf(radius):
+            raise NotImplementedError(
+                "Surface 0: a curved object surface cannot be exported to CODE V"
+            )
+
+    def _check_stop(self) -> None:
+        """Find the aperture stop, the surface Optiland resolves as ``stop_index``.
+
+        Only that surface gets an ``STO`` line, even if several surfaces are
+        flagged. An optic with no real surface (no more than an object and an
+        image) has no stop to check.
+
+        Raises:
+            ValueError: If an optic with a real surface has no stop surface.
+            NotImplementedError: If the stop is the object or the image surface.
+        """
+        self._stop_index = None
+        surfaces = self._optic.surfaces
+        if len(surfaces) <= 2:
+            return
+        try:
+            index = surfaces.stop_index
+        except ValueError:
+            raise ValueError(
+                "The optic has no aperture stop surface; CODE V needs one"
+            ) from None
+        if index == 0 or index == len(surfaces) - 1:
+            kind = "object" if index == 0 else "image"
+            raise NotImplementedError(
+                f"Surface {index}: the aperture stop on the {kind} surface "
+                "cannot be exported to CODE V"
+            )
+        self._stop_index = index
+
+    def _check_spacing_directions(self) -> None:
+        """Refuse a system whose light Optiland starts out towards -z.
+
+        CODE V always starts propagating along +z, and ``THI`` is the signed
+        distance along the light. The entry direction is the one Optiland's own
+        paraxial trace uses (``ParaxialPath.entry_direction``, including its
+        virtual-object override), so a virtual object, a negative gap later in
+        a lens (a cover glass) and a stop placed behind the lens are written
+        when Optiland itself travels +z, and refused when it does not.
+
+        Raises:
+            NotImplementedError: If Optiland's entry direction points towards -z.
+        """
+        surfaces = self._optic.surfaces
+        if len(surfaces) < 2:
+            return
+        object_thickness = _scalar(surfaces[0].thickness)
+        if math.isnan(object_thickness) or object_thickness == -math.inf:
+            return  # no direction to decide; the object distance is refused later
+        path = surfaces.build_paraxial_path()
+        if _scalar(path.entry_direction[2]) < 0.0:
+            raise NotImplementedError(
+                "Surface 1: Optiland starts the light out travelling in -z "
+                "(the leg from the object to the first surface runs towards "
+                "-z); CODE V always starts along +z, so this cannot be "
+                "exported to CODE V"
+            )
+
     def _check_offsets(self) -> None:
         """Refuse decentered, tilted or chained surfaces.
 
@@ -182,6 +316,8 @@ class OpticToCodeVConverter:
     # ------------------------------------------------------------------
 
     def _convert_aperture(self, model: CodeVDataModel) -> None:
+        if self._optic.obj_space_telecentric:
+            model.aperture["TEL"] = "Y"  # object-space telecentric pupil
         ap = self._optic.aperture
         if ap is None:
             return
@@ -193,6 +329,18 @@ class OpticToCodeVConverter:
                 f"Aperture float_by_stop_size (stop diameter {float(ap.value):.8g}, "
                 f"surface {self._optic.surfaces.stop_index}) is exported as a "
                 f"fixed EPD of {epd:.8g}; the stop-size constraint is not kept.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return
+        if ap.ap_type == "imageFNO" and self._finite_object():
+            # CODE V reads FNO as the working F-number at a finite object.
+            epd = _scalar(self._optic.paraxial.EPD())
+            model.aperture["EPD"] = epd
+            warnings.warn(
+                f"Aperture imageFNO ({float(ap.value):.8g}) with an object at a "
+                f"finite distance is exported as a fixed EPD of {epd:.8g}, because "
+                "CODE V reads FNO as the working F-number there.",
                 UserWarning,
                 stacklevel=3,
             )
@@ -212,6 +360,11 @@ class OpticToCodeVConverter:
             )
             return
         model.aperture[cv_key] = float(ap.value)
+
+    def _finite_object(self) -> bool:
+        """Return True if the object is closer than CODE V's infinity (1e10)."""
+        spacings = self._vertex_spacings()
+        return bool(spacings) and spacings[0] < _INFINITE_OBJECT_DISTANCE
 
     # ------------------------------------------------------------------
     # Fields
@@ -265,12 +418,11 @@ class OpticToCodeVConverter:
         wls = self._optic.wavelengths
         data: list[float] = []
         weights: list[float] = []
-        primary_index = 0
-        for i, w in enumerate(wls):
+        for w in wls:
             data.append(float(w.value))
             weights.append(float(w.weight))
-            if w.is_primary:
-                primary_index = i
+        # the primary Optiland uses (the first one flagged), not the last
+        primary_index = wls.primary_index if data else 0
 
         model.wavelengths = {
             "data": data,  # in um; encoder converts to nm
@@ -506,7 +658,8 @@ class OpticToCodeVConverter:
         raw["thickness"] = thickness
         raw["type"] = "standard"
 
-        if surface.is_stop:
+        # Optiland's stop is the first surface flagged; CODE V takes exactly one STO
+        if output_idx == self._stop_index:
             raw["is_stop"] = True
 
         raw.update(self._aperture_keys(surface.aperture, output_idx))
@@ -559,13 +712,42 @@ class OpticToCodeVConverter:
 
         # Catalog glass with a verified CODE V name
         named = codev_glass_name(mat)
+        out_of_range = False
         if named is not None:
-            return {"name": named[0], "catalog": named[1]}
+            out_of_range = self._range_violation(mat, surf_idx)
+            if not out_of_range:
+                return {"name": named[0], "catalog": named[1]}
 
         # Everything else -> private glass with the exact indices
-        return {"private": self._register_private_glass(mat, surf_idx)}
+        return {
+            "private": self._register_private_glass(
+                mat, surf_idx, out_of_range=out_of_range
+            )
+        }
 
-    def _register_private_glass(self, mat: Any, surf_idx: int) -> str:
+    def _range_violation(self, mat: Any, surf_idx: int) -> bool:
+        """Warn and return True if a system wavelength is outside the glass range."""
+        wl_data = self._private_model.wavelengths
+        data = wl_data.get("data", [])
+        found = wavelength_outside_range(
+            mat, [data[i] for i in wavelength_write_order(wl_data)]
+        )
+        if found is None:
+            return False
+        wavelength, low, high = found
+        warnings.warn(
+            f"Surface {surf_idx}: glass '{getattr(mat, 'name', type(mat).__name__)}' "
+            f"has data only from {low:.8g} to {high:.8g} um, but the system "
+            f"wavelength {wavelength:.8g} um is outside it and CODE V would "
+            "abort the load; written as a private glass instead.",
+            UserWarning,
+            stacklevel=5,
+        )
+        return True
+
+    def _register_private_glass(
+        self, mat: Any, surf_idx: int, out_of_range: bool = False
+    ) -> str:
         """Add a material to the private glass catalog and return its name.
 
         The index is evaluated at the wavelengths in the order they are written
@@ -574,6 +756,9 @@ class OpticToCodeVConverter:
         Args:
             mat: The surface material.
             surf_idx: Output surface index (used in messages).
+            out_of_range: True if the glass has a CODE V catalog entry but a
+                system wavelength is outside its range (the range warning has
+                already been given).
 
         Returns:
             The private glass name, ``OPT1``, ``OPT2``, ...
@@ -627,10 +812,20 @@ class OpticToCodeVConverter:
         name = f"OPT{len(self._private) + 1}"  # at most 8 characters
         self._private[key] = name
         model.private_glasses[name] = indices
+        if out_of_range:
+            message = (
+                f"Surface {surf_idx}: glass '{label}' is written as private glass "
+                f"'{name}' with n at the system wavelengths because its catalog "
+                "range does not cover them."
+            )
+        else:
+            message = (
+                f"Surface {surf_idx}: glass '{label}' has no verified CODE V "
+                f"catalog entry; written as private glass '{name}' with n at the "
+                "system wavelengths."
+            )
         warnings.warn(
-            f"Surface {surf_idx}: glass '{label}' has no verified CODE V catalog "
-            f"entry; written as private glass '{name}' with n at the system "
-            "wavelengths.",
+            message,
             UserWarning,
             stacklevel=5,
         )
