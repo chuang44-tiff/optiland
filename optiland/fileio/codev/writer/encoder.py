@@ -22,7 +22,7 @@ _FIELD_TYPE_CMDS: dict[str, tuple[str, str]] = {
     "angle": ("XAN", "YAN"),
     "object_height": ("XOB", "YOB"),
     "paraxial_image_height": ("XIM", "YIM"),
-    "real_image_height": ("XIM", "YIM"),
+    "real_image_height": ("XRI", "YRI"),
 }
 
 # Map from CODE V aperture key to command string
@@ -35,20 +35,42 @@ _AP_KEY_TO_CMD: dict[str, str] = {
 
 
 def _fmt(value: float) -> str:
-    """Format a float compactly without unnecessary trailing zeros.
+    """Format a float compactly, without losing any digit.
+
+    The shortest ``%g`` form of at least 8 significant digits that reads back
+    as exactly ``value`` is written (at most 17), so ``5.0`` is ``5``, ``0.1``
+    is ``0.1``, ``1e10`` is ``1e+10`` and ``4910.01016`` keeps all its digits.
+    A zero, including ``-0.0``, is written ``0``.
 
     Args:
         value: The float to format.
 
     Returns:
-        A compact string representation.
+        A compact string representation that round-trips through ``float``.
 
     Raises:
         ValueError: If ``value`` is not finite (CODE V has no ``inf``/``nan``).
     """
     if not math.isfinite(value):
         raise ValueError(f"Cannot write non-finite value ({value!r}) to a CODE V file")
-    return f"{value:.8g}"
+    value = float(value)
+    if value == 0.0:
+        return "0"
+    for digits in range(8, 17):
+        text = f"{value:.{digits}g}"
+        if float(text) == value:
+            return text
+    return f"{value:.17g}"
+
+
+def _um_to_nm(wavelength: float) -> float:
+    """Convert a wavelength from micrometres to nanometres.
+
+    The product is rounded to 9 decimals of a nanometre so that binary
+    arithmetic noise (``0.4861 * 1000`` is ``486.09999999999997``) does not
+    reach the file now that numbers are written at full precision.
+    """
+    return round(float(wavelength) * 1000.0, 9)
 
 
 def _check_numbers(where: str, mapping: dict[str, Any]) -> None:
@@ -101,10 +123,6 @@ def _check_finite(model: CodeVDataModel) -> None:
             _check_numbers(where, glass)
             if "private" in glass:
                 _check_private_glass(model, where, glass["private"])
-        r_max = getattr(raw.get("aperture"), "r_max", None)
-        if r_max is not None and (math.isnan(r_max) or r_max == -math.inf):
-            # +inf means "no limit" and is written as no CIR line
-            raise ValueError(f"{where}: non-finite aperture r_max ({float(r_max)!r})")
 
 
 def wavelength_write_order(wl_data: dict[str, Any]) -> list[int]:
@@ -194,7 +212,7 @@ class CodeVFileEncoder:
             return
         order = wavelength_write_order(wl_data)
         # Convert um -> nm
-        lines.append("WL " + _fmt_list([data[i] * 1000.0 for i in order]))
+        lines.append("WL " + _fmt_list([_um_to_nm(data[i]) for i in order]))
 
         weights = wl_data.get("weights")
         if weights:
@@ -218,7 +236,9 @@ class CodeVFileEncoder:
         if not y_vals:
             return
 
-        x_cmd, y_cmd = _FIELD_TYPE_CMDS.get(field_type, ("XAN", "YAN"))
+        if field_type not in _FIELD_TYPE_CMDS:
+            raise ValueError(f"header: unknown field type '{field_type}'")
+        x_cmd, y_cmd = _FIELD_TYPE_CMDS[field_type]
 
         if x_vals and any(abs(v) > 1e-12 for v in x_vals):
             lines.append(f"{x_cmd} " + _fmt_list(x_vals))
@@ -236,7 +256,9 @@ class CodeVFileEncoder:
         wl_data = self._model.wavelengths
         order = wavelength_write_order(wl_data)
         lines.append("PRV")
-        lines.append("  PWL " + _fmt_list([wl_data["data"][i] * 1000.0 for i in order]))
+        lines.append(
+            "  PWL " + _fmt_list([_um_to_nm(wl_data["data"][i]) for i in order])
+        )
         for name, indices in glasses.items():
             lines.append(f"  '{name}' " + " ".join(f"{n:.10g}" for n in indices))
         lines.append("END")
@@ -319,15 +341,10 @@ class CodeVFileEncoder:
                 lines.append(f"  {label} {_fmt(val)}")
 
     def _encode_physical_aperture(self, lines: list[str], raw: dict[str, Any]) -> None:
-        aperture = raw.get("aperture")
-        if aperture is None:
-            return
-        try:
-            r_max = float(aperture.r_max)
-            if r_max != math.inf:  # no clear aperture limit; NaN still reaches _fmt
-                lines.append(f"  CIR CLR {_fmt(r_max)}")
-        except AttributeError:
-            pass
+        if "cir" in raw:
+            lines.append(f"  CIR CLR {_fmt(raw['cir'])}")
+        if "cir_obs" in raw:
+            lines.append(f"  CIR OBS {_fmt(raw['cir_obs'])}")
 
     def _encode_glass_inline(self, glass: dict[str, Any]) -> str:
         """Build the glass string for the surface line.

@@ -1931,3 +1931,336 @@ class TestImageSurface:
             warnings.simplefilter("ignore")
             lines = _encode(getattr(samples, name)())
         assert [line for line in lines if line.startswith("SI")] == [expected]
+
+
+# ---------------------------------------------------------------------------
+# Surface apertures
+# ---------------------------------------------------------------------------
+
+
+def _ap_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if "CIR" in line]
+
+
+class TestSurfaceApertures:
+    @pytest.mark.parametrize(
+        ("r_max", "r_min", "expected"),
+        [
+            (5.0, 0.0, ["  CIR CLR 5"]),
+            (5.0, 2.0, ["  CIR CLR 5", "  CIR OBS 2"]),
+            (float("inf"), 2.0, ["  CIR OBS 2"]),
+            (float("inf"), 0.0, []),
+        ],
+    )
+    def test_radial_aperture_lines(self, r_max, r_min, expected, set_test_backend):
+        from optiland.physical_apertures import RadialAperture
+
+        lines = _encode(_lens_with_aperture(RadialAperture(r_max, r_min)))
+        assert _ap_lines(lines) == expected
+
+    @pytest.mark.parametrize(
+        ("r_max", "r_min"),
+        [
+            (2.0, 2.0),
+            (2.0, 3.0),
+            (-1.0, 0.0),
+            (5.0, -1.0),
+            (5.0, float("nan")),
+            (5.0, float("inf")),
+        ],
+    )
+    def test_invalid_radial_aperture_raises_and_leaves_file(
+        self, r_max, r_min, tmp_path, set_test_backend
+    ):
+        from optiland.physical_apertures import RadialAperture
+
+        optic = _lens_with_aperture(RadialAperture(r_max, r_min))
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(ValueError, match=r"Surface 1: invalid aperture"):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda m: m.OffsetRadialAperture(5.0, 0.0, 1.0, -2.0),
+            lambda m: m.RectangularAperture(-3, 3, -2, 2),
+            lambda m: m.EllipticalAperture(4, 2),
+            lambda m: m.PolygonAperture([0, 1, 1], [0, 0, 1]),
+            lambda m: m.UnionAperture(m.RadialAperture(5.0), m.RadialAperture(3.0)),
+            lambda m: m.RotatedAperture(m.RadialAperture(5.0), 10.0),
+        ],
+    )
+    def test_other_apertures_warn_and_write_nothing(self, make, set_test_backend):
+        import optiland.physical_apertures as m
+
+        aperture = make(m)
+        name = type(aperture).__name__
+        with pytest.warns(UserWarning, match=f"aperture {name} has no verified CODE V"):
+            lines = _encode(_lens_with_aperture(aperture))
+        assert _ap_lines(lines) == []
+
+    def test_unclipped_aperture_is_silent(self, set_test_backend):
+        import warnings
+
+        from optiland.physical_apertures import RadialAperture, UnclippedAperture
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            lines = _encode(_lens_with_aperture(UnclippedAperture(RadialAperture(5.0))))
+        assert _ap_lines(lines) == []
+
+    @pytest.mark.parametrize("index", [0, 3])
+    def test_end_surface_aperture_warns_and_writes_nothing(
+        self, index, set_test_backend
+    ):
+        from optiland.physical_apertures import RadialAperture
+
+        optic = _make_lens()
+        optic.surfaces[index].aperture = RadialAperture(5.0, 1.0)
+        kind = "object" if index == 0 else "image"
+        with pytest.warns(
+            UserWarning,
+            match=rf"Surface {index}: an aperture on the {kind} surface is not "
+            "exported to CODE V",
+        ) as record:
+            lines = _encode(optic)
+        assert not any("no verified" in str(w.message) for w in record)
+        assert _ap_lines(lines) == []
+
+    def test_empty_and_one_surface_optics_do_not_raise(self, set_test_backend):
+        assert OpticToCodeVConverter(Optic()).convert().surfaces == {}
+        optic = Optic()
+        optic.surfaces.add(index=0, thickness=float("inf"))
+        OpticToCodeVConverter(optic).convert()
+
+
+# ---------------------------------------------------------------------------
+# Field definitions
+# ---------------------------------------------------------------------------
+
+
+def _lens_with_field_type(field_type: str, ys=(0.0, 5.0)) -> Optic:
+    optic = _make_lens()
+    optic.fields.set_type(field_type)
+    optic.fields.fields.clear()
+    for y in ys:
+        optic.fields.add(y=y)
+    return optic
+
+
+class TestFieldDefinitions:
+    @pytest.mark.parametrize(
+        ("field_type", "command", "absent"),
+        [
+            ("real_image_height", "YRI", ("YIM", "YAN", "YOB")),
+            ("paraxial_image_height", "YIM", ("YRI", "YAN", "YOB")),
+            ("object_height", "YOB", ("YRI", "YIM", "YAN")),
+            ("angle", "YAN", ("YRI", "YIM", "YOB")),
+        ],
+    )
+    def test_field_type_command(self, field_type, command, absent, set_test_backend):
+        lines = _encode(_lens_with_field_type(field_type))
+        assert f"{command} 0 5" in lines
+        for other in absent:
+            assert not any(line.startswith(other) for line in lines)
+
+    def test_real_image_height_x_field_writes_xri(self, set_test_backend):
+        optic = _lens_with_field_type("real_image_height")
+        optic.fields.add(x=2.0, y=1.0)
+        lines = _encode(optic)
+        assert "XRI 0 0 2" in lines
+        assert "YRI 0 5 1" in lines
+
+    def test_unknown_field_definition_refused(self, tmp_path, set_test_backend):
+        class MysteryField:
+            pass
+
+        optic = _make_lens()
+        optic.fields.field_definition = MysteryField()
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(NotImplementedError, match="MysteryField"):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"
+
+    def test_field_definition_none_defaults_to_angle(self, set_test_backend):
+        optic = _make_lens()
+        optic.fields.field_definition = None
+        assert "YAN 0" in _encode(optic)
+
+    def test_encoder_refuses_unknown_field_type(self):
+        model = CodeVDataModel()
+        model.fields = {"type": "mystery", "x": [0.0], "y": [1.0]}
+        with pytest.raises(ValueError, match="unknown field type 'mystery'"):
+            CodeVFileEncoder(model).encode()
+
+
+# ---------------------------------------------------------------------------
+# Field vignetting
+# ---------------------------------------------------------------------------
+
+
+class TestVignettingWarning:
+    @pytest.mark.parametrize("axis", ["vx", "vy"])
+    def test_nonzero_vignetting_warns_and_writes_no_vu_lines(
+        self, axis, set_test_backend
+    ):
+        optic = _make_lens()
+        optic.fields.add(y=5.0, **{axis: 0.2})
+        with pytest.warns(UserWarning, match="vignetting factors"):
+            lines = _encode(optic)
+        assert not any(line.startswith(("VU", "VL")) for line in lines)
+
+    @pytest.mark.parametrize("axis", ["vx", "vy"])
+    def test_nan_vignetting_warns(self, axis, set_test_backend):
+        optic = _make_lens()
+        optic.fields.add(y=5.0, **{axis: float("nan")})
+        with pytest.warns(UserWarning, match="vignetting factors"):
+            _encode(optic)
+
+    def test_no_vignetting_no_warning(self, set_test_backend):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _encode(_make_lens())
+
+
+# ---------------------------------------------------------------------------
+# float_by_stop_size aperture
+# ---------------------------------------------------------------------------
+
+
+class TestFloatByStopAperture:
+    def test_written_as_fixed_epd_with_warning(self, set_test_backend):
+        import warnings
+
+        import optiland.backend as be
+        from optiland.samples.objectives import CookeTriplet
+
+        optic = CookeTriplet()
+        optic.set_aperture(aperture_type="float_by_stop_size", value=8.0)
+        expected = float(be.to_numpy(be.atleast_1d(optic.paraxial.EPD())).ravel()[0])
+        with pytest.warns(
+            UserWarning, match=r"Aperture float_by_stop_size \(stop diameter"
+        ) as record:
+            model = OpticToCodeVConverter(optic).convert()
+        assert any("fixed EPD" in str(w.message) for w in record)
+        assert isinstance(model.aperture["EPD"], float)
+        assert_allclose(model.aperture["EPD"], expected)
+        assert abs(model.aperture["EPD"] - 8.0) > 0.1
+        assert list(model.aperture) == ["EPD"]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lines = CodeVFileEncoder(model).encode()
+        epd_lines = [line for line in lines if line.startswith("EPD ")]
+        assert len(epd_lines) == 1
+        assert float(epd_lines[0].split()[1]) == model.aperture["EPD"]
+
+    def test_epd_aperture_no_warning(self, set_test_backend):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            model = OpticToCodeVConverter(_make_lens()).convert()
+        assert_allclose(model.aperture["EPD"], 10.0)
+
+
+# ---------------------------------------------------------------------------
+# Full-precision numbers
+# ---------------------------------------------------------------------------
+
+
+class TestFullPrecisionNumbers:
+    def test_hubble_lines_keep_every_digit(self, set_test_backend):
+        import warnings
+
+        from optiland import samples
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lines = _encode(samples.HubbleTelescope())
+        s_lines = [line for line in lines if line.startswith("S ")]
+        for token in ("-11040.02286", "4910.01016", "6365.20955", "-1349.31166"):
+            assert any(token in line.split() for line in s_lines), token
+
+    def test_long_float_round_trips_exactly(self):
+        from optiland.fileio.codev.writer.encoder import _fmt
+
+        value = 50.123456789012345
+        assert float(_fmt(value)) == value
+
+    @pytest.mark.parametrize("value", [0.0, -0.0])
+    def test_zero_is_written_without_sign(self, value):
+        from optiland.fileio.codev.writer.encoder import _fmt
+
+        assert _fmt(value) == "0"
+
+    @pytest.mark.parametrize(
+        "value, text",
+        [(5.0, "5"), (0.1, "0.1"), (1e10, "1e+10"), (-12.0, "-12")],
+    )
+    def test_short_values_stay_short(self, value, text):
+        from optiland.fileio.codev.writer.encoder import _fmt
+
+        assert _fmt(value) == text
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_still_refused(self, value):
+        from optiland.fileio.codev.writer.encoder import _fmt
+
+        with pytest.raises(ValueError, match="non-finite"):
+            _fmt(value)
+
+    def test_wavelengths_carry_no_binary_noise(self, set_test_backend):
+        import warnings
+
+        from optiland.materials import IdealMaterial
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lines = _encode(_lens_with_materials(IdealMaterial(1.5)))
+        wl_lines = [line for line in lines if line.startswith("WL ")]
+        assert wl_lines == ["WL 656.3 587.6 486.1"]
+
+
+# ---------------------------------------------------------------------------
+# CODE V count limits (21 wavelengths, 25 fields; CODE V 2025.03)
+# ---------------------------------------------------------------------------
+
+
+def _lens_with_counts(n_wavelengths: int, n_fields: int) -> Optic:
+    optic = _make_lens()
+    optic.wavelengths.wavelengths.clear()
+    for i in range(n_wavelengths):
+        optic.wavelengths.add(value=0.5 + 0.01 * i, is_primary=i == 0)
+    optic.fields.fields.clear()
+    for i in range(n_fields):
+        optic.fields.add(y=float(i))
+    return optic
+
+
+class TestCountLimits:
+    def test_limits_export(self, set_test_backend):
+        lines = _encode(_lens_with_counts(21, 25))
+        wl = next(line for line in lines if line.startswith("WL "))
+        yan = next(line for line in lines if line.startswith("YAN "))
+        assert len(wl.split()) - 1 == 21
+        assert len(yan.split()) - 1 == 25
+
+    @pytest.mark.parametrize(
+        ("counts", "message"),
+        [
+            ((22, 1), "CODE V supports at most 21 wavelengths; this optic has 22"),
+            ((1, 26), "CODE V supports at most 25 fields; this optic has 26"),
+        ],
+    )
+    def test_over_limit_refused(self, counts, message, tmp_path, set_test_backend):
+        optic = _lens_with_counts(*counts)
+        path = tmp_path / "existing.seq"
+        path.write_bytes(b"previous design")
+        with pytest.raises(ValueError, match=message):
+            save_codev_file(optic, str(path))
+        assert path.read_bytes() == b"previous design"

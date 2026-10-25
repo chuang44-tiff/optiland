@@ -23,12 +23,14 @@ from optiland.fileio.codev.surfaces import (
 from optiland.fileio.codev.writer.encoder import wavelength_write_order
 from optiland.fileio.codev.writer.glass_names import codev_glass_name
 from optiland.fileio.common import (
+    FIELD_CLASS_TO_TYPE,
     field_type_string,
     is_air,
     reject_unsupported_ideal_absorption,
     validate_material_propagation,
 )
 from optiland.materials.data import DataMaterial
+from optiland.physical_apertures import RadialAperture, UnclippedAperture
 
 if TYPE_CHECKING:
     from optiland.optic import Optic
@@ -43,6 +45,11 @@ _GEOM_STR_TO_TYPE: dict[str, str] = {
 # CODE V has no infinity; an object distance of 1e10 or more is treated as infinite.
 _INFINITE_OBJECT_DISTANCE = 1e10
 
+
+# CODE V 2025.03 accepts at most 21 wavelengths and 25 fields and silently drops
+# the rest (with only a warning), so a larger optic is refused instead.
+_CODEV_MAX_WAVELENGTHS = 21
+_CODEV_MAX_FIELDS = 25
 
 # Coordinate system entries that move or tilt a surface (z is its axial position).
 _OFFSET_KEYS = ("x", "y", "rx", "ry", "rz")
@@ -99,6 +106,7 @@ class OpticToCodeVConverter:
         validate_material_propagation(self._optic)
         self._check_object_medium()
         self._check_offsets()
+        self._check_counts()
         model = CodeVDataModel()
         model.name = self._optic.name
         model.radius_mode = True  # always write radii
@@ -117,6 +125,25 @@ class OpticToCodeVConverter:
         if surfaces and not is_air(surfaces[0].material_post):
             raise NotImplementedError(
                 "Surface 0: an object-space medium cannot be exported to CODE V yet"
+            )
+
+    def _check_counts(self) -> None:
+        """Refuse more wavelengths or fields than CODE V loads.
+
+        Raises:
+            ValueError: If the optic has more than 21 wavelengths or 25 fields.
+        """
+        n_wl = len(self._optic.wavelengths.wavelengths)
+        if n_wl > _CODEV_MAX_WAVELENGTHS:
+            raise ValueError(
+                f"CODE V supports at most {_CODEV_MAX_WAVELENGTHS} wavelengths; "
+                f"this optic has {n_wl}"
+            )
+        n_fields = self._optic.fields.num_fields
+        if n_fields > _CODEV_MAX_FIELDS:
+            raise ValueError(
+                f"CODE V supports at most {_CODEV_MAX_FIELDS} fields; "
+                f"this optic has {n_fields}"
             )
 
     def _check_offsets(self) -> None:
@@ -158,14 +185,23 @@ class OpticToCodeVConverter:
         ap = self._optic.aperture
         if ap is None:
             return
+        if ap.ap_type == "float_by_stop_size":
+            # The stop-size constraint has no CODE V form: write the EPD it gives.
+            epd = _scalar(self._optic.paraxial.EPD())
+            model.aperture["EPD"] = epd
+            warnings.warn(
+                f"Aperture float_by_stop_size (stop diameter {float(ap.value):.8g}, "
+                f"surface {self._optic.surfaces.stop_index}) is exported as a "
+                f"fixed EPD of {epd:.8g}; the stop-size constraint is not kept.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return
         # Map Optiland aperture types to CODE V keys
         mapping = {
             "EPD": "EPD",
             "imageFNO": "FNO",
-            "paraxialImageFNO": "FNO",
             "objectNA": "NAO",
-            "imageNA": "NA",
-            "float_by_stop_size": "EPD",
         }
         cv_key = mapping.get(ap.ap_type)
         if cv_key is None:
@@ -182,17 +218,36 @@ class OpticToCodeVConverter:
     # ------------------------------------------------------------------
 
     def _convert_fields(self, model: CodeVDataModel) -> None:
-        field_type = field_type_string(self._optic)
         fields = self._optic.fields
+        definition = fields.field_definition
+        if (
+            definition is not None
+            and type(definition).__name__ not in FIELD_CLASS_TO_TYPE
+        ):
+            raise NotImplementedError(
+                f"field definition '{type(definition).__name__}' has no CODE V "
+                "equivalent"
+            )
+        field_type = field_type_string(self._optic)
         n = fields.num_fields
 
         x_vals = [float(f.x) for f in fields]
         y_vals = [float(f.y) for f in fields]
 
-        try:
-            weights = [float(f.weight) for f in fields]
-        except AttributeError:
-            weights = [1.0] * n
+        weights = [float(f.weight) for f in fields]
+
+        vignetted = [
+            i
+            for i, f in enumerate(fields)
+            if _scalar(f.vx) != 0.0 or _scalar(f.vy) != 0.0
+        ]
+        if vignetted:
+            warnings.warn(
+                "Field vignetting factors (vx, vy) are not exported yet; "
+                f"non-zero at field(s) {', '.join(map(str, vignetted))}.",
+                UserWarning,
+                stacklevel=3,
+            )
 
         model.fields = {
             "num_fields": n,
@@ -270,6 +325,7 @@ class OpticToCodeVConverter:
         output_idx = 0
 
         # Object surface (SO)
+        self._warn_end_surface_aperture(obj_surface, 0)
         obj_thickness = _object_distance(
             spacings[0] if spacings else _scalar(obj_surface.thickness)
         )
@@ -290,11 +346,70 @@ class OpticToCodeVConverter:
         radius = 0.0
         if len(all_surfaces) > 1:
             radius = self._image_radius(all_surfaces[-1], output_idx)
+            self._warn_end_surface_aperture(all_surfaces[-1], output_idx)
         model.surfaces[output_idx] = {
             "type": "image",
             "radius": radius,
             "thickness": 0.0,
         }
+
+    @staticmethod
+    def _warn_not_exported(aperture: Any, surf_idx: int) -> None:
+        """Warn that an aperture class has no verified CODE V equivalent."""
+        warnings.warn(
+            f"Surface {surf_idx}: aperture {type(aperture).__name__} has no "
+            "verified CODE V equivalent yet; not exported",
+            UserWarning,
+            stacklevel=4,
+        )
+
+    def _warn_end_surface_aperture(self, surface: Any, surf_idx: int) -> None:
+        """Warn about an aperture on the object or image surface (not written)."""
+        aperture = surface.aperture
+        if aperture is None or isinstance(aperture, UnclippedAperture):
+            return
+        kind = "object" if surf_idx == 0 else "image"
+        warnings.warn(
+            f"Surface {surf_idx}: an aperture on the {kind} surface is not "
+            "exported to CODE V",
+            UserWarning,
+            stacklevel=4,
+        )
+
+    def _aperture_keys(self, aperture: Any, surf_idx: int) -> dict[str, float]:
+        """Return the ``cir``/``cir_obs`` entries for a surface aperture.
+
+        Only a plain ``RadialAperture`` is exported: a finite ``r_max`` becomes
+        ``cir`` (``CIR CLR``) and ``r_min > 0`` becomes ``cir_obs``
+        (``CIR OBS``). An infinite ``r_max`` means "no limit" and writes no
+        ``CIR CLR``. Every other class is warned about and not written.
+
+        Raises:
+            ValueError: If ``r_max`` is NaN or ``-inf``, or ``r_min`` is not a
+                finite non-negative number below ``r_max``.
+        """
+        if aperture is None or isinstance(aperture, UnclippedAperture):
+            return {}
+        if type(aperture) is not RadialAperture:
+            self._warn_not_exported(aperture, surf_idx)
+            return {}
+        r_max = _scalar(aperture.r_max)
+        r_min = _scalar(aperture.r_min)
+        if math.isnan(r_max) or r_max == -math.inf:
+            raise ValueError(
+                f"Surface {surf_idx}: non-finite aperture r_max ({r_max!r})"
+            )
+        if not (0.0 <= r_min < r_max):
+            raise ValueError(
+                f"Surface {surf_idx}: invalid aperture, need 0 <= r_min < r_max "
+                f"(r_min={r_min!r}, r_max={r_max!r})"
+            )
+        keys: dict[str, float] = {}
+        if r_max != math.inf:
+            keys["cir"] = r_max
+        if r_min > 0.0:
+            keys["cir_obs"] = r_min
+        return keys
 
     @staticmethod
     def _image_radius(surface: Any, output_idx: int) -> float:
@@ -394,9 +509,7 @@ class OpticToCodeVConverter:
         if surface.is_stop:
             raw["is_stop"] = True
 
-        # Physical aperture
-        if surface.aperture is not None:
-            raw["aperture"] = surface.aperture
+        raw.update(self._aperture_keys(surface.aperture, output_idx))
 
         # Glass — check reflective flag first (mirror)
         is_reflective = getattr(
