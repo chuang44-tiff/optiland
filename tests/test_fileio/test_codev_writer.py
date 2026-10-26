@@ -840,6 +840,22 @@ class TestGlassNames:
         assert codev_glass_name("N-BK7") is None
         assert codev_glass_name(None) is None
 
+    def test_material_without_catalog_file_unnamed(self):
+        from optiland.fileio.codev.writer.glass_names import codev_glass_name
+        from optiland.materials import Material
+
+        mat = Material("N-BK7", "schott")
+        mat.material_data = {}
+        assert codev_glass_name(mat) is None
+
+    def test_material_without_data_has_no_range(self):
+        from optiland.fileio.codev.writer.glass_names import (
+            wavelength_outside_range,
+        )
+        from optiland.materials import IdealMaterial
+
+        assert wavelength_outside_range(IdealMaterial(1.5), [0.1, 10.0]) is None
+
     def test_name_charset_whole_db(self):
         import re
 
@@ -1298,6 +1314,15 @@ class TestPrivateGlass:
         ):
             save_codev_file(optic, str(path))
         assert path.read_bytes() == b"previous design"
+
+    def test_private_glass_without_wavelengths_raises(self, set_test_backend):
+        from optiland.materials import IdealMaterial
+
+        converter = OpticToCodeVConverter(_lens_with_materials(IdealMaterial(1.5)))
+        converter._private = {}
+        converter._private_model = CodeVDataModel()
+        with pytest.raises(ValueError, match="needs a private glass but the system"):
+            converter._register_private_glass(IdealMaterial(1.5), 1)
 
     def test_converter_reuse_does_not_carry_private_glasses(self, set_test_backend):
         import warnings
